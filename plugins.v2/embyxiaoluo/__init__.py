@@ -1,8 +1,9 @@
-﻿#!/usr/bin/python3
+#!/usr/bin/python3
 # -*- coding: UTF-8 -*-
 import json
 import re
 import html
+import io
 import tempfile
 from pathlib import Path
 from urllib.parse import quote
@@ -11,9 +12,11 @@ import traceback
 import threading
 import time
 import ipaddress
-from datetime import datetime
+from collections import Counter
+from datetime import datetime, timedelta, timezone
 from typing import Any, List, Dict, Tuple, Optional
 
+from apscheduler.triggers.cron import CronTrigger
 from starlette.requests import Request
 
 from app.core.config import settings
@@ -141,6 +144,9 @@ class _EpisodeCache:
         merged["episode_merged"] = True
         merged["episode_range"] = ep_range
         merged["episode_count"] = len(episodes)
+        # 多集合并时，单集标题/简介只属于第一集，容易误导：直接清空
+        merged["episode_title"] = ""
+        merged["episode_overview"] = ""
         s = merged.get("season_id", "")
         merged["episode_text"] = f"第{s}季：第{ep_range}集（共{len(episodes)}集）"
         unsent = [ep for ep in episodes if not self._is_recently_sent(self._send_key(ep))]
@@ -154,10 +160,10 @@ class _EpisodeCache:
 
 
 class embyxiaoluo(_PluginBase):
-    plugin_name = "Emby 入库通知"
-    plugin_desc = "监听 Emby / Jellyfin 的 Webhook，入库或删除媒体时按自定义模板推送到 Telegram 与飞书；封面与详情取自 Emby（原名/时长/类型/分类/评分），支持剧集合并与消息去重。"
+    plugin_name = "Emby 聚合通知"
+    plugin_desc = "把 Emby 的入库、删除、事件与每日观影报告聚合推送到 Telegram / 飞书；模板可自定义，支持实时预览与测试发送。"
     plugin_icon = "https://raw.githubusercontent.com/xiaoluo-mp/MoviePilot-Local-Plugins/main/plugins.v2/embyxiaoluo/logo.png?v=1.0.17"
-    plugin_version = "1.0.20"
+    plugin_version = "1.0.44"
     plugin_author = "小罗"
     author_url = "https://github.com/xiaoluo-mp/MoviePilot-Local-Plugins"
     plugin_config_prefix = "embyxiaoluo_"
@@ -200,6 +206,24 @@ class embyxiaoluo(_PluginBase):
     # 飞书（本地改版新增）
     _tg_title_template: str = ""
     _tg_body_template: str = ""
+    # 电影专用模板（仅 split_by_type 开启时生效；留空回落上面的共用模板）
+    _split_by_type: bool = False
+    _tg_movie_title_template: str = ""
+    _tg_movie_body_template: str = ""
+    _feishu_movie_title_template: str = ""
+    _feishu_movie_body_template: str = ""
+    # 每日观影报告（本地改版新增）
+    _report_enabled: bool = False
+    _report_time: str = "22:00"
+    _report_period: str = "daily"
+    _report_sort: str = "count"
+    _report_limit: int = 5
+    _report_background: str = "purple"
+    _report_background_url: str = ""
+    _report_tg_title_template: str = ""
+    _report_tg_body_template: str = ""
+    _report_feishu_title_template: str = ""
+    _report_feishu_body_template: str = ""
     _tg_enabled: bool = True
     _feishu_enabled: bool = True
     _feishu_mode: str = "mp"
@@ -216,6 +240,11 @@ class embyxiaoluo(_PluginBase):
     _event_feishu_body_template: str = ""
     _event_tg_title_template: str = ""
     _event_tg_body_template: str = ""
+    # 删除通知模板（2026-11-17 新增：与入库模板并列，可自定义）
+    _del_tg_title_template: str = ""
+    _del_tg_body_template: str = ""
+    _del_feishu_title_template: str = ""
+    _del_feishu_body_template: str = ""
     _feishu_title_template: str = ""
     _feishu_body_template: str = ""
     _test_action: str = ""
@@ -230,6 +259,11 @@ class embyxiaoluo(_PluginBase):
         self._message_fingerprints = {}
         if not config:
             return
+        # 旧模板把 {{library}} 当「分类」用：加载时按新语义（分类=电影/电视剧、
+        # 类别=媒体库名）拆成两行，并顺手去掉 {{cast}}：{{cast}} 这类重复变量
+        migrated = self._migrate_template_config(config)
+        if migrated is not None:
+            config = migrated
         self._enabled = config.get("enabled", False)
         self._use_mp_tg = config.get("use_mp_tg", False)
         self._mp_tg_channel = config.get("mp_tg_channel", "")
@@ -286,6 +320,37 @@ class embyxiaoluo(_PluginBase):
         self._event_feishu_body_template = config.get("event_feishu_body_template") or ""
         self._event_tg_title_template = config.get("event_tg_title_template") or ""
         self._event_tg_body_template = config.get("event_tg_body_template") or ""
+        self._del_tg_title_template = config.get("del_tg_title_template") or ""
+        self._del_tg_body_template = config.get("del_tg_body_template") or ""
+        self._del_feishu_title_template = config.get("del_feishu_title_template") or ""
+        self._del_feishu_body_template = config.get("del_feishu_body_template") or ""
+        # 电影 / 剧集模板：默认共用一套；开启分开设计后，电影单独用下面这组
+        self._split_by_type = bool(config.get("split_by_type"))
+        self._tg_movie_title_template = config.get("tg_movie_title_template") or ""
+        self._tg_movie_body_template = config.get("tg_movie_body_template") or ""
+        self._feishu_movie_title_template = config.get("feishu_movie_title_template") or ""
+        self._feishu_movie_body_template = config.get("feishu_movie_body_template") or ""
+        # 每日观影报告
+        self._report_enabled = bool(config.get("report_enabled"))
+        self._report_time = str(config.get("report_time") or "22:00").strip() or "22:00"
+        self._report_period = str(config.get("report_period") or "daily").lower()
+        if self._report_period not in ("daily", "weekly", "monthly"):
+            self._report_period = "daily"
+        self._report_sort = str(config.get("report_sort") or "count").lower()
+        if self._report_sort not in ("count", "minutes"):
+            self._report_sort = "count"
+        try:
+            self._report_limit = max(1, min(30, int(config.get("report_limit") or 5)))
+        except (TypeError, ValueError):
+            self._report_limit = 5
+        self._report_background = str(config.get("report_background") or "purple").lower()
+        if self._report_background in ("", "none"):
+            self._report_background = "purple"
+        self._report_background_url = str(config.get("report_background_url") or "").strip()
+        self._report_tg_title_template = config.get("report_tg_title_template") or ""
+        self._report_tg_body_template = config.get("report_tg_body_template") or ""
+        self._report_feishu_title_template = config.get("report_feishu_title_template") or ""
+        self._report_feishu_body_template = config.get("report_feishu_body_template") or ""
         self._feishu_title_template = config.get("feishu_title_template") or self._default_feishu_title_template()
         self._feishu_body_template = config.get("feishu_body_template") or self._default_feishu_body_template()
         self._test_action = str(config.get("test_action") or "")
@@ -493,7 +558,8 @@ class embyxiaoluo(_PluginBase):
             "👀 标题：<b>{{item_name}}</b>\n"
             "📺 季集：{{episode_text}}\n"
             "🎬 影片信息\n"
-            "📚 分类：{{library}}\n"
+            "🎞 分类：{{category}}\n"
+            "📚 类别：{{library}}\n"
             "🎭 类型：{{genres}}\n"
             "⭐ 评分：{{rating}}\n"
             "📅 发行：{{release_date}}\n"
@@ -540,7 +606,8 @@ class embyxiaoluo(_PluginBase):
             "**👀标题：{{item_name}}**\n"
             " 📺 季集：{{episode_text}}\n"
             "**🎬 影片信息**\n"
-            "📚 分类：{{library}}\n"
+            "🎞 分类：{{category}}\n"
+            "📚 类别：{{library}}\n"
             "🎭 类型：{{genres}}\n"
             "⭐ 评分：{{rating}}\n"
             "📅 发行：{{release_date}}\n"
@@ -552,6 +619,1105 @@ class embyxiaoluo(_PluginBase):
             "📁 文件：{{file_path}}\n"
             "🔗TMDB:[立即查询]({{tmdb_url}})\n"
         )
+
+    # ==================== 模板语义修正（本地改版新增） ====================
+
+    TEMPLATE_TITLE_KEYS = (
+        "tg_title_template",
+        "feishu_title_template",
+        "del_tg_title_template",
+        "del_feishu_title_template",
+        "event_tg_title_template",
+        "event_feishu_title_template",
+        "wx_title_template",
+        "bark_title_template",
+    )
+
+    TEMPLATE_BODY_KEYS = (
+        "tg_body_template",
+        "feishu_body_template",
+        "wx_body_template",
+        "bark_body_template",
+        "del_tg_body_template",
+        "del_feishu_body_template",
+        "event_tg_body_template",
+        "event_feishu_body_template",
+    )
+
+    @staticmethod
+    def _migrate_body_labels(text: str) -> str:
+        """
+        把旧模板里「分类：{{library}}」这一行拆成两行，语义对齐：
+
+        - 分类 = 电影 / 电视剧（``{{category}}``）
+        - 类别 = Emby 媒体库名（``{{library}}``）
+
+        只处理同时含「分类」与 ``{{library}}`` 的行，其余行原样保留（含缩进与样式标签）。
+
+        :param text: 模板正文
+        :return str: 修正后的正文；无需修正时原样返回
+        """
+
+        if not text:
+            return text
+        changed = False
+        rows: List[str] = []
+        for line in text.splitlines():
+            if "分类" in line and "{{library}}" in line:
+                category_line = line.replace("{{library}}", "{{category}}")
+                # 分类与类别用不同图标，避免两行长得一模一样
+                if "📚" in category_line:
+                    category_line = category_line.replace("📚", "🎞", 1)
+                rows.append(category_line)
+                rows.append(line.replace("分类", "类别"))
+                changed = True
+            elif "分类" in line and "{{category}}" in line and "📚" in line:
+                # 已经拆过行但图标重复：统一成 🎞
+                rows.append(line.replace("📚", "🎞", 1))
+                changed = True
+            else:
+                rows.append(line)
+        if not changed:
+            return text
+        fixed = "\n".join(rows)
+        return fixed + "\n" if text.endswith("\n") else fixed
+
+    def _migrate_template_config(self, config: dict) -> Optional[dict]:
+        """
+        统一修正模板里的旧写法并落库（幂等）。
+
+        包含两件事：分类/类别按新语义拆行；``{{cast}}：{{cast}}`` 这类重复变量去重。
+
+        :param config: 当前配置
+        :return Optional[dict]: 有改动时返回新配置，无改动返回 None
+        """
+
+        updated = dict(config or {})
+        changed = False
+        # 旧版事件模板（只有条目/用户/设备），用于识别并升级成带「事件 + 详情」的新版
+        old_tg_title = "📢 <b>{{event_text}}</b> · {{item_name}}"
+        old_tg_body = (
+            "📺 {{item_name}}{{episode_text}}\n👤 用户：{{user_name}}\n🖥️ 设备：{{device_name}}\n"
+            "🌐 IP：{{ip_text}}\n⏱️ 进度：{{progress}}\n📝 剧情：{{overview}}\n🕐 时间：{{added_at}}"
+        )
+        old_fs_title = "📢 {{event_text}} · {{item_name}}"
+        old_fs_body = (
+            "📺 条目：{{item_name}}{{episode_text}}\n👤 用户：{{user_name}}\n🖥️ 设备：{{device_name}}\n"
+            "🌐 IP：{{ip_text}}\n⏱️ 进度：{{progress}}\n📝 剧情：{{overview}}\n🕐 时间：{{added_at}}"
+        )
+        for key in self.TEMPLATE_BODY_KEYS:
+            value = str(updated.get(key) or "")
+            if not value:
+                continue
+            fixed = self._migrate_body_labels(value).replace("{{cast}}：{{cast}}", "：{{cast}}")
+            if fixed != value:
+                updated[key] = fixed
+                changed = True
+                logger.info(f"Emby入库通知 已修正模板「{key}」的分类/类别写法")
+        # 事件模板旧默认（只有条目/用户/设备）升级成「事件 + 详情 + …」，只替换完全一致的内容
+        new_defaults = {
+            "event_tg_title_template": self._default_event_tg_title_template(),
+            "event_tg_body_template": self._default_event_tg_body_template(),
+            "event_feishu_title_template": self._default_event_feishu_title_template(),
+            "event_feishu_body_template": self._default_event_feishu_body_template(),
+        }
+        for key, old_value in (
+            ("event_tg_title_template", old_tg_title),
+            ("event_tg_body_template", old_tg_body),
+            ("event_feishu_title_template", old_fs_title),
+            ("event_feishu_body_template", old_fs_body),
+        ):
+            if str(updated.get(key) or "") == old_value:
+                updated[key] = new_defaults[key]
+                changed = True
+        # 标题模板两端的空格/全角空格没有意义，只会让标题看起来被挤到中间
+        for key in self.TEMPLATE_TITLE_KEYS:
+            value = str(updated.get(key) or "")
+            if not value:
+                continue
+            fixed = value.strip(" \t\u3000\u00a0")
+            if fixed != value:
+                updated[key] = fixed
+                changed = True
+                logger.info(f"Emby入库通知 已去掉标题模板「{key}」两端的空白")
+        if not changed:
+            return None
+        try:
+            self.update_config(updated)
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning(f"Emby入库通知 模板修正落库失败：{e}")
+        return updated
+
+    # ==================== 每日观影报告（本地改版新增） ====================
+
+    REPORT_TZ = timezone(timedelta(hours=8))
+
+    @staticmethod
+    def _default_report_tg_title_template() -> str:
+        return "📊 {{period_label}}｜{{range_text}}"
+
+    @staticmethod
+    def _default_report_tg_body_template() -> str:
+        return (
+            "🎬 电影 {{movie_count}} 部　📺 剧集 {{episode_count}} 集\n"
+            "⏱ 总时长 {{total_hours}}\n"
+            "👥 {{user_list}}\n\n"
+            "{{movie_block_html}}\n\n{{episode_block_html}}\n\n"
+            "🖥️ {{server_name}}"
+        )
+
+    @staticmethod
+    def _default_report_feishu_title_template() -> str:
+        return "📊 {{period_label}}｜{{range_text}}"
+
+    @staticmethod
+    def _default_report_feishu_body_template() -> str:
+        return (
+            "🎬 电影 **{{movie_count}}** 部　📺 剧集 **{{episode_count}}** 集\n"
+            "⏱ 总时长 **{{total_hours}}**\n"
+            "👥 {{user_list}}\n\n"
+            "{{movie_block}}\n\n{{episode_block}}\n\n"
+            "🖥️ {{server_name}}"
+        )
+
+    @staticmethod
+    def _activity_user_name(entry: Dict[str, Any]) -> str:
+        """
+        从活动日志的文案里取用户名（Emby 活动日志的 UserId 是内部数字 ID，取不到名字）。
+
+        两种句式：
+        ``设备 上 用户名 已停止播放 xxx`` / ``用户名 在 设备 上开始播放 xxx``
+
+        :param entry: 活动日志条目
+        :return str: 用户名；取不到返回空串
+        """
+
+        text = str(entry.get("Name") or "")
+        matched = re.match(r"^.+? 上 (.+?) (?:已停止|开始)播放", text)
+        if matched:
+            return matched.group(1).strip()
+        matched = re.match(r"^(.+?) 在 .+? 上(?:开始|已停止)播放", text)
+        if matched:
+            return matched.group(1).strip()
+        return ""
+
+    @classmethod
+    def _parse_emby_time(cls, text: str) -> Optional[datetime]:
+        """
+        解析 Emby 的 ISO 时间（带 7 位小数与 Z），转成北京时间。
+
+        :param text: 原始时间串
+        :return Optional[datetime]: 解析失败返回 None
+        """
+
+        raw = str(text or "").strip()
+        if not raw:
+            return None
+        raw = raw.replace("Z", "+00:00")
+        matched = re.match(r"^(.*\.\d{6})\d*(\+.*)?$", raw)
+        if matched:  # Python 只认 6 位小数
+            raw = matched.group(1) + (matched.group(2) or "")
+        try:
+            return datetime.fromisoformat(raw).astimezone(cls.REPORT_TZ)
+        except ValueError:
+            return None
+
+    def _emby_json(self, path: str, params: Optional[dict] = None, timeout: int = 15):
+        """带 api_key 的 Emby GET（失败返回 None，不抛异常）。"""
+
+        host, apikey = self._emby_credentials
+        if not (host and apikey):
+            return None
+        try:
+            res = requests.get(
+                f"{host}{path}",
+                params={"api_key": apikey, **(params or {})},
+                timeout=timeout,
+            )
+            if res.status_code == 200:
+                return res.json()
+            logger.debug(f"Emby入库通知 报告接口 {path} 返回 HTTP {res.status_code}")
+        except Exception as e:  # pylint: disable=broad-except
+            logger.debug(f"Emby入库通知 报告接口 {path} 失败：{e}")
+        return None
+
+    def _collect_playback_reporting(
+        self, days: int
+    ) -> Optional[Tuple[Dict[str, Dict[str, Any]], datetime]]:
+        """
+        用 Emby 的 Playback Reporting 插件（`/user_usage_stats/UserPlaylist`）取播放记录。
+
+        该插件按「每次播放」存一条记录（含观看秒数），比活动日志完整，也天然包含
+        「播放完」的记录。插件未安装/接口不可用时返回 None，由调用方回落活动日志。
+
+        :param days: 回溯天数
+        :return Optional[Tuple[plays, start]]: 播放汇总与统计起点
+        """
+
+        users = self._emby_json("/Users") or []
+        if not isinstance(users, list) or not users:
+            return None
+        now = datetime.now(self.REPORT_TZ)
+        end_date = now.strftime("%Y-%m-%d")
+        start_date = (now - timedelta(days=days - 1)).date()
+        plays: Dict[str, Dict[str, Any]] = {}
+        reachable = False
+        for user in users:
+            uid = str(user.get("Id") or "")
+            if not uid:
+                continue
+            rows = self._emby_json(
+                "/user_usage_stats/UserPlaylist",
+                {"user_id": uid, "aggregate_data": "false", "days": days, "end_date": end_date},
+                timeout=25,
+            )
+            if rows is None:
+                continue
+            reachable = True
+            if not isinstance(rows, list):
+                continue
+            for row in rows:
+                date_text = str((row or {}).get("date") or "")
+                try:
+                    played_date = datetime.strptime(date_text, "%Y-%m-%d").date()
+                except ValueError:
+                    continue
+                if played_date < start_date:
+                    continue
+                item_id = str(row.get("item_id") or "")
+                if not item_id:
+                    continue
+                info = plays.setdefault(item_id, {"count": 0, "users": set(), "seconds": 0.0})
+                info["count"] += 1
+                name = str(row.get("user_name") or user.get("Name") or "")
+                if name:
+                    info["users"].add(name)
+                try:
+                    info["seconds"] += float(row.get("duration") or 0)
+                except (TypeError, ValueError):
+                    pass
+        if not reachable:
+            return None
+        start = datetime.combine(start_date, datetime.min.time()).replace(tzinfo=self.REPORT_TZ)
+        logger.info(
+            f"Emby入库通知 观影数据来源：Playback Reporting（{len(plays)} 个条目 / {days} 天）"
+        )
+        return plays, start
+
+    def _collect_log_plays(self, days: int) -> Tuple[Dict[str, Dict[str, Any]], datetime]:
+        """
+        回落方案：Emby 活动日志（playback.start/stop）+ 用户「已播放」列表。
+
+        :param days: 回溯天数
+        :return Tuple[plays, start]: 播放汇总与统计起点
+        """
+
+        start = (datetime.now(self.REPORT_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+                 - timedelta(days=days - 1))
+        entries: List[Dict[str, Any]] = []
+        index = 0
+        while index < 3000:
+            data = self._emby_json(
+                "/System/ActivityLog/Entries", {"StartIndex": index, "Limit": 500}
+            ) or {}
+            batch = data.get("Items") or []
+            if not batch:
+                break
+            reached_old = False
+            for entry in batch:
+                when = self._parse_emby_time(entry.get("Date"))
+                if when is None:
+                    continue
+                if when < start:
+                    reached_old = True
+                    continue
+                entries.append({**entry, "_ts": when})
+            index += len(batch)
+            if reached_old:
+                break
+
+        users = {
+            str(user.get("Id")): str(user.get("Name") or "")
+            for user in (self._emby_json("/Users") or [])
+        }
+
+        def _user_name(entry: Dict[str, Any]) -> str:
+            user_id = str(entry.get("UserId") or "")
+            return self._activity_user_name(entry) or users.get(user_id) or (
+                f"用户{user_id}" if user_id else ""
+            )
+
+        # 按「观看会话」统计：一次会话 = 一次 start→stop；只有 stop（换端续播/崩溃）
+        # 或只有 start（还在播/中断）也算一次观看，避免「看完了却没算进去」。
+        sessions: Dict[str, Dict[str, Any]] = {}
+        pending: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        durations: Dict[Tuple[str, str], float] = {}
+
+        def _add_session(item_id: str, entry: Dict[str, Any]) -> None:
+            info = sessions.setdefault(item_id, {"count": 0, "users": set()})
+            info["count"] += 1
+            name = _user_name(entry)
+            if name:
+                info["users"].add(name)
+
+        for entry in sorted(entries, key=lambda item: item["_ts"]):
+            kind = str(entry.get("Type") or "")
+            if kind not in ("playback.start", "playback.stop"):
+                continue
+            item_id = str(entry.get("ItemId") or "")
+            user_id = str(entry.get("UserId") or "")
+            if not item_id:
+                continue
+            key = (item_id, user_id)
+            if kind == "playback.start":
+                pending[key] = entry
+                continue
+            began = pending.pop(key, None)
+            _add_session(item_id, entry)
+            if began:
+                seconds = (entry["_ts"] - began["_ts"]).total_seconds()
+                if 0 < seconds <= 12 * 3600:
+                    durations[key] = durations.get(key, 0.0) + seconds
+        for (item_id, _uid), entry in list(pending.items()):
+            _add_session(item_id, entry)
+
+        plays: Dict[str, Dict[str, Any]] = {
+            item_id: {"count": info["count"], "users": set(info["users"]), "seconds": 0.0}
+            for item_id, info in sessions.items()
+        }
+        for (item_id, _uid), seconds in durations.items():
+            if item_id in plays:
+                plays[item_id]["seconds"] += seconds
+
+        # 活动日志可能缺记录：按用户的「已播放」列表补一次，保证「看完了」的也算
+        try:
+            for user in (self._emby_json("/Users") or []):
+                uid = str(user.get("Id") or "")
+                user_name = str(user.get("Name") or "")
+                if not uid:
+                    continue
+                data = self._emby_json(
+                    f"/Users/{uid}/Items",
+                    {
+                        "Recursive": "true", "Filters": "IsPlayed", "Limit": 200,
+                        "SortBy": "DatePlayed", "SortOrder": "Descending",
+                        "IncludeItemTypes": "Movie,Episode",
+                        "Fields": "UserData,SeriesId,SeriesName,ParentIndexNumber,"
+                                  "IndexNumber,RunTimeTicks,Type",
+                    },
+                    timeout=20,
+                ) or {}
+                for item in data.get("Items") or []:
+                    played_at = self._parse_emby_time(
+                        str((item.get("UserData") or {}).get("LastPlayedDate") or "")
+                    )
+                    if not played_at or played_at < start:
+                        continue
+                    item_id = str(item.get("Id") or "")
+                    if not item_id:
+                        continue
+                    info = plays.setdefault(
+                        item_id, {"count": 0, "users": set(), "seconds": 0.0}
+                    )
+                    if int(info.get("count") or 0) == 0:
+                        info["count"] = 1
+                    if user_name:
+                        info["users"].add(user_name)
+        except Exception as e:  # pylint: disable=broad-except
+            logger.debug(f"Emby入库通知 已播放列表补充失败：{e}")
+        logger.info(f"Emby入库通知 观影数据来源：活动日志（{len(plays)} 个条目 / {days} 天）")
+        return plays, start
+
+    def _collect_daily_plays(self, days: int = 1) -> Dict[str, Any]:
+        """
+        汇总指定天数内的播放记录：优先 Playback Reporting 插件，取不到再用活动日志。
+
+        :param days: 回溯天数（日榜 1 / 周榜 7 / 月榜 30）
+        :return Dict[str, Any]: ``{"movies": [...], "episodes": [...], "start": datetime}``
+        """
+
+        days = max(1, min(92, int(days or 1)))
+        source = self._collect_playback_reporting(days)
+        if source is None:
+            plays, start = self._collect_log_plays(days)
+        else:
+            plays, start = source
+
+        ids = list(plays)[:80]
+        detail: Dict[str, Dict[str, Any]] = {}
+        if ids:
+            data = self._emby_json(
+                "/Items",
+                {
+                    "Ids": ",".join(ids),
+                    "Fields": "Name,Type,SeriesName,SeriesId,ParentIndexNumber,IndexNumber,"
+                              "RunTimeTicks,ProductionYear",
+                },
+                timeout=20,
+            ) or {}
+            for item in data.get("Items") or []:
+                detail[str(item.get("Id"))] = item
+
+        movies: List[Dict[str, Any]] = []
+        series_map: Dict[str, Dict[str, Any]] = {}
+        for item_id, info in plays.items():
+            item = detail.get(item_id) or {}
+            item_type = str(item.get("Type") or "")
+            seconds = float(info.get("seconds") or 0)
+            if seconds <= 0:
+                runtime = float(item.get("RunTimeTicks") or 0) / 10000000.0
+                seconds = min(runtime, 3 * 3600) * max(int(info.get("count") or 1), 1) if runtime else 0
+            record = {
+                "item_id": item_id,
+                "name": str(item.get("Name") or "未知条目"),
+                "count": int(info.get("count") or 0),
+                "minutes": int(round(seconds / 60)),
+                "users": sorted(info.get("users") or []),
+                "episode": "",
+                "episodes": 0,
+                "series_id": str(item.get("SeriesId") or ""),
+            }
+            if item_type == "Episode":
+                # 剧集按「剧」聚合：同一部剧的多个单集合并成一条，只占一个名次
+                series_name = str(item.get("SeriesName") or record["name"])
+                key = record["series_id"] or series_name
+                group = series_map.setdefault(key, {
+                    "item_id": item_id,
+                    "name": series_name,
+                    "count": 0,
+                    "minutes": 0,
+                    "users": set(),
+                    "episode": "",
+                    "episodes": 0,
+                    "series_id": record["series_id"],
+                })
+                group["count"] += record["count"]
+                group["minutes"] += record["minutes"]
+                group["episodes"] += 1
+                group["users"].update(record["users"])
+                if not group["item_id"] and item_id:
+                    group["item_id"] = item_id
+            else:
+                movies.append(record)
+        episodes: List[Dict[str, Any]] = []
+        for group in series_map.values():
+            group["users"] = sorted(group["users"])
+            episodes.append(group)
+        if self._report_sort == "minutes":
+            movies.sort(key=lambda x: (-x["minutes"], -x["count"]))
+            episodes.sort(key=lambda x: (-x["minutes"], -x["count"]))
+        else:
+            movies.sort(key=lambda x: (-x["count"], -x["minutes"]))
+            episodes.sort(key=lambda x: (-x["count"], -x["minutes"]))
+        return {"movies": movies, "episodes": episodes, "start": start, "days": days}
+
+    def _report_context(self, data: Dict[str, Any], limit: int) -> Dict[str, Any]:
+        """
+        把播放汇总整理成模板变量。
+
+        :param data: `_collect_daily_plays()` 的结果
+        :param limit: 每类最多列几条
+        :return Dict[str, Any]: 模板变量
+        """
+
+        movies = list(data.get("movies") or [])
+        episodes = list(data.get("episodes") or [])
+        total_minutes = sum(item["minutes"] for item in movies + episodes)
+        hours, minutes = divmod(total_minutes, 60)
+        total_hours = f"{hours} 小时 {minutes} 分钟" if hours else f"{minutes} 分钟"
+
+        def _lines(items: List[Dict[str, Any]], is_series: bool = False) -> str:
+            rows = []
+            for index, item in enumerate(items[:limit], start=1):
+                if is_series and item.get("episodes"):
+                    body = f"{item['episodes']} 集 · {item['count']} 次 · {item['minutes']} 分钟"
+                else:
+                    body = f"{item['count']} 次 · {item['minutes']} 分钟"
+                rows.append(f"{index}. {item['name']}（{body}）")
+            return "\n".join(rows) or "暂无"
+
+        user_counter: Counter = Counter()
+        for item in movies + episodes:
+            for name in item.get("users") or []:
+                user_counter[name] += item["count"]
+        user_list = " / ".join(f"{name} {count} 次" for name, count in user_counter.most_common()) or "暂无"
+
+        today = datetime.now(self.REPORT_TZ)
+        weekdays = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
+        period = self._report_period if self._report_period in ("daily", "weekly", "monthly") else "daily"
+        days = int(data.get("days") or (1 if period == "daily" else 7 if period == "weekly" else 30))
+        begin = today - timedelta(days=days - 1)
+        if period == "daily":
+            period_label, rank_label = "日报", "日榜"
+            range_text = today.strftime("%Y-%m-%d")
+        elif period == "weekly":
+            period_label, rank_label = "周报", "周榜"
+            range_text = f"{begin.strftime('%Y-%m-%d')} ~ {today.strftime('%Y-%m-%d')}"
+        else:
+            period_label, rank_label = "月报", "月榜"
+            range_text = f"{begin.strftime('%Y-%m-%d')} ~ {today.strftime('%Y-%m-%d')}"
+        return {
+            "date": today.strftime("%Y-%m-%d"),
+            "weekday": weekdays[today.weekday()],
+            "period_label": period_label,
+            "rank_label": rank_label,
+            "range_text": range_text,
+            "days": days,
+            "movie_count": len(movies),
+            "episode_count": len(episodes),
+            "total_count": len(movies) + len(episodes),
+            "total_minutes": total_minutes,
+            "total_hours": total_hours,
+            "movie_list": _lines(movies),
+            "episode_list": _lines(episodes, is_series=True),
+            # 区块：带小标题的整段，没有内容时为空串（模板里留空就不会出现空小节）
+            # markdown 版给飞书，_html 版给 Telegram
+            "movie_block": ("**🎬 电影**\n" + _lines(movies)) if movies else "",
+            "episode_block": ("**📺 剧集**\n" + _lines(episodes, is_series=True)) if episodes else "",
+            "movie_block_html": ("🎬 电影\n" + _lines(movies)) if movies else "",
+            "episode_block_html": ("📺 剧集\n" + _lines(episodes, is_series=True)) if episodes else "",
+            "user_list": user_list,
+            "limit": limit,
+            "sort_label": "按时长" if self._report_sort == "minutes" else "按次数",
+            "server_name": self._emby_server_name or "Emby",
+        }
+
+    @staticmethod
+    def _render_report_template(template: str, ctx: Dict[str, Any], escape_html: bool = False) -> str:
+        """
+        渲染观影报告模板（只替换已知变量，未定义的保持空串）。
+
+        :param template: 模板正文/标题
+        :param ctx: 变量表
+        :param escape_html: 传给 TG 时是否转义 HTML
+        :return str: 渲染结果
+        """
+
+        def _replace(match):
+            value = str(ctx.get(match.group(1).strip(), ""))
+            return html.escape(value) if escape_html else value
+
+        return re.sub(r"\{\{\s*([a-zA-Z0-9_]+)\s*\}\}", _replace, template or "")
+
+    @staticmethod
+    def _sample_report_data() -> Dict[str, Any]:
+        """当天没有播放记录时用于预览/测试的样例数据。"""
+
+        return {
+            "days": 1,
+            "movies": [
+                {"item_id": "", "name": "复仇者联盟4：终局之战", "count": 1,
+                 "minutes": 181, "users": ["小罗"], "episode": "", "series_id": ""},
+                {"item_id": "", "name": "星际穿越", "count": 1,
+                 "minutes": 169, "users": ["小罗"], "episode": "", "series_id": ""},
+            ],
+            "episodes": [
+                {"item_id": "", "name": "今天是太阳雨", "count": 2, "minutes": 90,
+                 "users": ["小罗"], "episode": "S01E22", "series_id": ""},
+                {"item_id": "", "name": "诛仙", "count": 1, "minutes": 24,
+                 "users": ["小依"], "episode": "S01E05", "series_id": ""},
+            ],
+        }
+
+    def _send_report_preview(self, channel: str, title_tpl: str, body_tpl: str) -> Dict[str, Any]:
+        """设置页「发送测试消息」的报告场景：用今天的真实数据，没数据就用样例。"""
+
+        period_days = {"daily": 1, "weekly": 7, "monthly": 30}.get(self._report_period, 1)
+        data = self._collect_daily_plays(period_days)
+        if not (data.get("movies") or data.get("episodes")):
+            data = self._sample_report_data()
+            data["days"] = period_days
+        ctx = self._report_context(data, max(1, int(self._report_limit or 5)))
+        poster = self._build_report_poster(data, ctx)
+        try:
+            if channel == "telegram":
+                title = self._render_report_template(
+                    title_tpl or self._default_report_tg_title_template(), ctx, escape_html=True
+                ).strip()
+                body = self._drop_empty_label_lines(self._edge_strip(self._render_report_template(
+                    body_tpl or self._default_report_tg_body_template(), ctx, escape_html=True
+                )))
+                self._send_report_tg(title, body, poster)
+            else:
+                title = self._render_report_template(
+                    title_tpl or self._default_report_feishu_title_template(), ctx
+                ).strip()
+                body = self._tidy_feishu_body(self._render_report_template(
+                    body_tpl or self._default_report_feishu_body_template(), ctx
+                ))
+                self._send_feishu_app(
+                    title, body, {"image_bytes": poster, "item_name": "观影报告"},
+                    use_image=bool(poster),
+                )
+        except Exception as e:  # pylint: disable=broad-except
+            logger.error(f"EmbyNotify 观影报告测试发送失败：{e}")
+            return {"success": False, "message": f"发送失败：{e}", "data": None}
+        label = "Telegram" if channel == "telegram" else "飞书"
+        return {
+            "success": True,
+            "message": f"已发送{label}（观影报告 · {ctx['movie_count']} 部电影 / {ctx['episode_count']} 部剧集）",
+            "data": None,
+        }
+
+    # ---------- 观影报告海报（Pillow 合成，本地改版新增） ----------
+
+    POSTER_SIZE = (1600, 1000)
+    POSTER_THEMES = {
+        "purple": ((59, 10, 107), (214, 0, 143)),
+        "blue": ((10, 32, 84), (0, 122, 178)),
+        "dark": ((22, 22, 28), (54, 54, 66)),
+    }
+    POSTER_FONT_CANDIDATES = (
+        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    )
+
+    @classmethod
+    def _poster_font(cls, size: int):
+        """取一个支持中文的字体（取不到就用 Pillow 默认字体）。"""
+
+        from PIL import ImageFont  # pylint: disable=import-outside-toplevel
+
+        for path in cls.POSTER_FONT_CANDIDATES:
+            try:
+                return ImageFont.truetype(path, size)
+            except Exception:  # pylint: disable=broad-except
+                continue
+        return ImageFont.load_default()
+
+    def _download_image(self, url: str):
+        """下载远程图片为 PIL Image（失败返回 None）。"""
+
+        if not url or not str(url).startswith(("http://", "https://")):
+            return None
+        from PIL import Image  # pylint: disable=import-outside-toplevel
+
+        # 先直连（Emby 一般在内网，走代理反而失败），再退回代理
+        for kwargs in ({}, {"proxies": self._proxies}):
+            try:
+                res = requests.get(url, timeout=20, **kwargs)
+                if res.status_code == 200 and res.content:
+                    return Image.open(io.BytesIO(res.content)).convert("RGB")
+            except Exception as e:  # pylint: disable=broad-except
+                logger.debug(f"Emby入库通知 报告配图下载失败：{e}")
+                continue
+        return None
+
+    @staticmethod
+    def _fit_cover(image, size):
+        """按 cover 方式缩放并居中裁剪到指定尺寸。"""
+
+        from PIL import Image  # pylint: disable=import-outside-toplevel
+
+        width, height = size
+        scale = max(width / image.width, height / image.height)
+        resized = image.resize(
+            (max(1, int(image.width * scale)), max(1, int(image.height * scale)))
+        )
+        left = (resized.width - width) // 2
+        top = (resized.height - height) // 2
+        return resized.crop((left, top, left + width, top + height))
+
+    def _poster_background(self, data: Dict[str, Any]):
+        """生成海报底图：预设渐变 / 播放最多影片背景 / 自定义图片。"""
+
+        from PIL import Image, ImageDraw, ImageFilter  # pylint: disable=import-outside-toplevel
+
+        width, height = self.POSTER_SIZE
+        mode = (self._report_background or "purple").lower()
+        if mode == "none":
+            mode = "purple"
+        image = None
+        if mode in ("custom", "top"):
+            url = self._report_background_url if mode == "custom" else self._top_backdrop_url(data)
+            image = self._download_image(url)
+        if image is not None:
+            # 背景图要压暗 + 模糊，否则海报/剧照上的文字会盖过报告信息
+            canvas = self._fit_cover(image, self.POSTER_SIZE).filter(ImageFilter.GaussianBlur(6))
+            overlay = Image.new("RGB", self.POSTER_SIZE, (0, 0, 0))
+            canvas = Image.blend(canvas, overlay, 0.5)
+            # 左侧再加一层从黑到透明的竖向渐变，保证文字可读
+            shade = Image.new("RGBA", self.POSTER_SIZE, (0, 0, 0, 0))
+            shade_draw = ImageDraw.Draw(shade)
+            for x in range(0, width // 2):
+                alpha = int(150 * (1 - x / (width / 2)))
+                shade_draw.line((x, 0, x, height), fill=(0, 0, 0, alpha))
+            canvas = Image.alpha_composite(canvas.convert("RGBA"), shade).convert("RGB")
+        else:
+            top, bottom = self.POSTER_THEMES.get(mode, self.POSTER_THEMES["purple"])
+            column = Image.new("RGB", (1, height))
+            draw = ImageDraw.Draw(column)
+            for y in range(height):
+                ratio = y / max(1, height - 1)
+                draw.point((0, y), fill=(
+                    int(top[0] + (bottom[0] - top[0]) * ratio),
+                    int(top[1] + (bottom[1] - top[1]) * ratio),
+                    int(top[2] + (bottom[2] - top[2]) * ratio),
+                ))
+            canvas = column.resize(self.POSTER_SIZE)
+            # 左上角一圈柔光，避免纯渐变太平
+            glow = Image.new("L", (width // 2, width // 2), 0)
+            glow_draw = ImageDraw.Draw(glow)
+            glow_draw.ellipse((0, 0, width // 2, width // 2), fill=90)
+            glow = glow.filter(ImageFilter.GaussianBlur(120))
+            light = Image.new("RGB", self.POSTER_SIZE, (255, 255, 255))
+            canvas = Image.composite(light, canvas, glow.resize(self.POSTER_SIZE))
+        return canvas
+
+    def _top_backdrop_url(self, data: Dict[str, Any]) -> str:
+        """播放最多且有背景图的条目 → Emby 背景图地址。"""
+
+        host, apikey = self._emby_credentials
+        if not (host and apikey):
+            return ""
+        if self._report_sort == "minutes":
+            ordered = sorted(
+                list(data.get("movies") or []) + list(data.get("episodes") or []),
+                key=lambda x: (-int(x.get("minutes") or 0), -int(x.get("count") or 0)),
+            )
+        else:
+            ordered = sorted(
+                list(data.get("movies") or []) + list(data.get("episodes") or []),
+                key=lambda x: (-int(x.get("count") or 0), -int(x.get("minutes") or 0)),
+            )
+        for item in ordered:
+            target = str(item.get("series_id") or item.get("item_id") or "")
+            if not target:
+                continue
+            tags = (self._fetch_emby_item(target) or {}).get("BackdropImageTags")
+            if tags:
+                return f"{host}/Items/{target}/Images/Backdrop/0?maxWidth=1920&api_key={apikey}"
+        return ""
+
+    def _poster_poster(self, item: Dict[str, Any], size: Tuple[int, int]):
+        """取条目海报（剧集用剧集海报）；取不到时画占位块。"""
+
+        from PIL import Image, ImageDraw  # pylint: disable=import-outside-toplevel
+
+        host, apikey = self._emby_credentials
+        target = str(item.get("series_id") or item.get("item_id") or "")
+        image = None
+        if host and apikey and target:
+            image = self._download_image(
+                f"{host}/Items/{target}/Images/Primary?maxWidth=400&api_key={apikey}"
+            )
+        if image is not None:
+            return self._fit_cover(image, size)
+        placeholder = Image.new("RGB", size, (70, 70, 84))
+        draw = ImageDraw.Draw(placeholder)
+        draw.text(
+            (8, size[1] // 2 - 14),
+            str(item.get("name") or "")[:6],
+            font=self._poster_font(20),
+            fill=(200, 200, 210),
+        )
+        return placeholder
+
+    @staticmethod
+    def _rounded(image, radius: int):
+        """给图片加圆角。"""
+
+        from PIL import Image, ImageDraw  # pylint: disable=import-outside-toplevel
+
+        mask = Image.new("L", image.size, 0)
+        ImageDraw.Draw(mask).rounded_rectangle(
+            (0, 0, image.width - 1, image.height - 1), radius=radius, fill=255
+        )
+        result = image.convert("RGBA")
+        result.putalpha(mask)
+        return result
+
+    @staticmethod
+    def _poster_text(draw, xy, text, font, fill=(255, 255, 255), shadow=True):
+        """带轻微阴影的文字（渐变背景上更清晰）。"""
+
+        if shadow:
+            draw.text((xy[0] + 2, xy[1] + 2), text, font=font, fill=(0, 0, 0))
+        draw.text(xy, text, font=font, fill=fill)
+
+    @staticmethod
+    def _clip_text(text: str, font, max_width: int) -> str:
+        """按像素宽度截断文字并加省略号。"""
+
+        raw = str(text or "")
+        if font.getlength(raw) <= max_width:
+            return raw
+        while raw and font.getlength(raw + "…") > max_width:
+            raw = raw[:-1]
+        return raw + "…"
+
+    def _build_report_poster(self, data: Dict[str, Any], ctx: Dict[str, Any]) -> Optional[bytes]:
+        """
+        合成观影报告海报：左侧文字区，右侧「电影 / 剧集」两列海报（带排名与标题）。
+
+        :param data: 播放汇总
+        :param ctx: 报告变量
+        :return Optional[bytes]: PNG 字节；Pillow 不可用或出错时返回 None
+        """
+
+        try:
+            from PIL import Image, ImageDraw  # pylint: disable=import-outside-toplevel
+        except Exception:  # pylint: disable=broad-except
+            return None
+        try:
+            width, height = self.POSTER_SIZE
+            canvas = self._poster_background(data).convert("RGBA")
+            layer = Image.new("RGBA", self.POSTER_SIZE, (255, 255, 255, 0))
+            draw = ImageDraw.Draw(layer)
+
+            width, height = self.POSTER_SIZE
+            # 顶部标题：只保留「日榜 / 周榜 / 月榜」
+            draw.text((60, 34), str(ctx.get("rank_label") or "日榜"),
+                      font=self._poster_font(84), fill=(255, 255, 255))
+            info_font = self._poster_font(26)
+            info = (
+                f"{ctx.get('range_text', '')}　"
+                f"电影 {ctx.get('movie_count', 0)} 部 · 剧集 {ctx.get('episode_count', 0)} 集 · "
+                f"{ctx.get('total_hours', '0 分钟')}"
+            )
+            draw.text((width - 60 - info_font.getlength(info), 92), info,
+                      font=info_font, fill=(255, 255, 255, 225))
+            draw.text((width - 60 - self._poster_font(20).getlength(str(ctx.get("server_name") or "")),
+                       height - 44),
+                      str(ctx.get("server_name") or ""), font=self._poster_font(20),
+                      fill=(255, 255, 255, 175))
+
+            def wrap_lines(text: str, font, max_width: int, max_lines: int):
+                """按像素宽度折行，最后一行超出加省略号。"""
+                remaining = str(text or "")
+                lines: List[str] = []
+                while remaining and len(lines) < max_lines:
+                    if font.getlength(remaining) <= max_width:
+                        lines.append(remaining)
+                        remaining = ""
+                        break
+                    cut = len(remaining)
+                    while cut > 1 and font.getlength(remaining[:cut]) > max_width:
+                        cut -= 1
+                    if len(lines) == max_lines - 1:
+                        lines.append(self._clip_text(remaining, font, max_width))
+                        remaining = ""
+                        break
+                    lines.append(remaining[:cut])
+                    remaining = remaining[cut:]
+                return lines
+
+            # 上下两行：电影在上、剧集在下；每行最多 5 条横向排列
+            rows = (
+                ("电影", list(data.get("movies") or [])[:5], 196),
+                ("剧集", list(data.get("episodes") or [])[:5], 612),
+            )
+            slot_start = 116
+            slot_w = 288
+            poster_w, poster_h = 190, 266
+            title_font = self._poster_font(21)
+            meta_font = self._poster_font(17)
+            for title, items, items_y in rows:
+                # 行标题竖排在封面左侧（竖排两字）
+                label_font = self._poster_font(34)
+                step = 42
+                label_y = items_y + poster_h / 2 - len(title) * step / 2
+                for char_index, char in enumerate(title):
+                    draw.text((34, label_y + char_index * step), char,
+                              font=label_font, fill=(255, 255, 255))
+                if not items:
+                    draw.text((slot_start, items_y + poster_h // 2 - 16), "今日暂无",
+                              font=self._poster_font(22), fill=(255, 255, 255, 165))
+                for index, item in enumerate(items):
+                    slot_left = slot_start + index * slot_w
+                    poster_x = slot_left + (slot_w - poster_w) // 2
+                    poster = self._rounded(self._poster_poster(item, (poster_w, poster_h)), 12)
+                    layer.alpha_composite(poster, (poster_x, items_y))
+                    # 序号放在封面正上方（深色圆底 + 白字，任何背景都看得清）
+                    badge_cy = items_y - 26
+                    badge_cx = poster_x + poster_w / 2
+                    draw.ellipse(
+                        (badge_cx - 20, badge_cy - 20, badge_cx + 20, badge_cy + 20),
+                        fill=(0, 0, 0, 175), outline=(255, 255, 255, 225), width=2,
+                    )
+                    num_font = self._poster_font(22)
+                    number = str(index + 1)
+                    draw.text(
+                        (badge_cx - num_font.getlength(number) / 2, badge_cy - 12),
+                        number, font=num_font, fill=(255, 255, 255),
+                    )
+                    # 片名两行 + 次数/时长（剧集按「剧」显示，副标题带集数）
+                    label = str(item.get("name") or "")
+                    text_width = poster_w + 36
+                    lines = wrap_lines(label, title_font, text_width, 2)
+                    for line_index, line in enumerate(lines):
+                        line_x = poster_x + (poster_w - title_font.getlength(line)) / 2
+                        draw.text((line_x, items_y + poster_h + 6 + line_index * 23),
+                                  line, font=title_font, fill=(255, 255, 255))
+                    meta = self._clip_text(
+                        (f"{item.get('episodes')} 集 · " if item.get("episodes") else "")
+                        + f"{item.get('count')} 次 · {item.get('minutes')} 分钟",
+                        meta_font, text_width,
+                    )
+                    meta_x = poster_x + (poster_w - meta_font.getlength(meta)) / 2
+                    draw.text((meta_x, items_y + poster_h + 8 + len(lines) * 23),
+                              meta, font=meta_font, fill=(255, 255, 255, 200))
+
+            canvas = Image.alpha_composite(canvas, layer).convert("RGB")
+            buffer = io.BytesIO()
+            canvas.save(buffer, format="JPEG", quality=90, optimize=True)
+            return buffer.getvalue()
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning(f"Emby入库通知 报告海报生成失败：{e}")
+            return None
+
+    def _report_image_url(self, data: Dict[str, Any]) -> str:
+        """
+        报告配图：none / top（播放最多且有背景图的条目）/ custom（自填 URL）。
+
+        :param data: 播放汇总
+        :return str: 图片地址；不需要时为空串
+        """
+
+        mode = (self._report_background or "none").lower()
+        if mode == "custom":
+            return self._report_background_url
+        if mode != "top":
+            return ""
+        host, apikey = self._emby_credentials
+        if not (host and apikey):
+            return ""
+        for item in sorted(data.get("movies", []) + data.get("episodes", []),
+                           key=lambda x: (-x["count"], -x["minutes"])):
+            target = item.get("series_id") or item.get("item_id")
+            if not target:
+                continue
+            tags = (self._fetch_emby_item(str(target)) or {}).get("BackdropImageTags")
+            if tags:
+                return f"{host}/Items/{target}/Images/Backdrop/0?maxWidth=1920&api_key={apikey}"
+        return ""
+
+    def _send_report_tg(self, title: str, body: str, poster: Optional[bytes]) -> None:
+        """发 TG 观影报告：优先发海报（图文一条），发图失败再退回纯文字。"""
+
+        token = self._effective_tg_token
+        chat_id = self._effective_tg_chat_id
+        if not (token and chat_id):
+            return
+        api = self._effective_tg_api_host
+        body = re.sub(r"\n{3,}", "\n\n", body or "").strip()
+        text = self._keep_spaces(self._drop_empty_label_lines(f"{title}\n\n{body}".strip()))
+        try:
+            if poster:
+                caption = text if len(text) <= 1000 else (title or "观影报告")
+                res = requests.post(
+                    f"{api}/bot{token}/sendPhoto",
+                    data={"chat_id": str(chat_id), "parse_mode": "HTML", "caption": caption},
+                    files={"photo": ("report.jpg", poster, "image/jpeg")},
+                    timeout=40,
+                    proxies=self._proxies,
+                )
+                if res.status_code == 200:
+                    logger.info("Emby入库通知 观影报告海报发送成功")
+                    return
+                logger.warning(f"Emby入库通知 报告海报发送失败，改用纯文字：{res.status_code} {res.text[:120]}")
+            res = requests.post(
+                f"{api}/bot{token}/sendMessage",
+                json={"chat_id": chat_id, "text": text, "parse_mode": "HTML",
+                      "disable_web_page_preview": True},
+                timeout=20,
+                proxies=self._proxies,
+            )
+            if res.status_code == 200:
+                logger.info("Emby入库通知 观影报告文字发送成功")
+            else:
+                logger.error(f"Emby入库通知 观影报告发送失败：{res.status_code} {res.text[:120]}")
+        except Exception as e:  # pylint: disable=broad-except
+            logger.error(f"Emby入库通知 观影报告 TG 发送异常：{e}")
+
+    def _send_daily_report(self, force: bool = False) -> Dict[str, Any]:
+        """
+        生成并发送「今日观影报告」。
+
+        :param force: 当天没有记录时也发（测试用）
+        :return Dict[str, Any]: ``{"sent": 渠道数, "total": 条目数}``
+        """
+
+        period_days = {"daily": 1, "weekly": 7, "monthly": 30}.get(self._report_period, 1)
+        data = self._collect_daily_plays(period_days)
+        total = len(data.get("movies") or []) + len(data.get("episodes") or [])
+        if total == 0 and not force:
+            logger.info("【Emby入库通知】今日没有播放记录，跳过观影报告")
+            return {"sent": 0, "total": 0}
+        limit = max(1, int(self._report_limit or 5))
+        ctx = self._report_context(data, limit)
+        poster = self._build_report_poster(data, ctx)
+        sent = 0
+        if self._tg_enabled and self._effective_tg_token and self._effective_tg_chat_id:
+            title = self._render_report_template(
+                self._report_tg_title_template or self._default_report_tg_title_template(),
+                ctx,
+                escape_html=True,
+            ).strip()
+            body = self._drop_empty_label_lines(self._edge_strip(self._render_report_template(
+                self._report_tg_body_template or self._default_report_tg_body_template(),
+                ctx,
+                escape_html=True,
+            )))
+            self._send_report_tg(title, body, poster)
+            sent += 1
+        if self._feishu_enabled and self._feishu_configured:
+            title = self._render_report_template(
+                self._report_feishu_title_template or self._default_report_feishu_title_template(),
+                ctx,
+            ).strip()
+            body = self._tidy_feishu_body(self._render_report_template(
+                self._report_feishu_body_template or self._default_report_feishu_body_template(),
+                ctx,
+            ))
+            self._send_feishu_app(
+                title, body,
+                {"image_bytes": poster, "item_name": "观影报告"},
+                use_image=bool(poster),
+            )
+            sent += 1
+        logger.info(f"【Emby入库通知】观影报告已发送：{ctx['movie_count']} 部电影 / "
+                    f"{ctx['episode_count']} 部剧集，{sent} 个渠道")
+        return {"sent": sent, "total": total}
+
+    def scheduled_report(self) -> None:
+        """定时任务入口：发送每日观影报告。"""
+
+        if not self._report_enabled:
+            return
+        try:
+            self._send_daily_report()
+        except Exception as e:  # pylint: disable=broad-except
+            logger.error(f"【Emby入库通知】观影报告发送失败：{e}")
+
+    def get_service(self) -> List[Dict[str, Any]]:
+        """
+        注册每日观影报告的定时服务（未启用或时间非法时不注册）。
+
+        :return List[Dict[str, Any]]: 服务定义
+        """
+
+        if not self._report_enabled:
+            return []
+        try:
+            hour_text, minute_text = (self._report_time or "22:00").split(":")
+            hour, minute = int(hour_text), int(minute_text)
+            if not (0 <= hour <= 23 and 0 <= minute <= 59):
+                raise ValueError("时间超出范围")
+        except (ValueError, AttributeError):
+            logger.warning(f"【Emby入库通知】观影报告时间非法：{self._report_time}")
+            return []
+        # 报告周期只决定统计范围（日/周/月），通知仍然每天按设定时间发送
+        trigger = CronTrigger(hour=hour, minute=minute)
+        name = "Emby 观影报告（每天发送）"
+        return [{
+            "id": "embyxiaoluo_daily_report",
+            "name": name,
+            "trigger": trigger,
+            "func": self.scheduled_report,
+            "kwargs": {},
+        }]
 
     def get_state(self) -> bool:
         return self._enabled
@@ -735,6 +1901,15 @@ class embyxiaoluo(_PluginBase):
                 event_info.item_id = item.get("SeriesId") or item.get("Id")
                 event_info.season_id = str(s) if s else None
                 event_info.episode_id = str(e) if e else None
+                if str(item_type_raw) == "Episode":
+                    # item_id 存的是剧集 ID（封面/详情要用），但单集自己的标题/简介
+                    # 只在这里拿得到：单存一份，避免下游误用剧集简介
+                    event_info.json_object = {
+                        **(event_info.json_object or {}),
+                        "episode_item_id": item.get("Id"),
+                        "episode_name": item.get("Name"),
+                        "episode_overview": item.get("Overview"),
+                    }
             elif item_type_raw == "Audio":
                 event_info.item_type = "AUD"
                 event_info.item_name = item.get("Album") or item.get("Name")
@@ -817,8 +1992,13 @@ class embyxiaoluo(_PluginBase):
                         self._dispatch(event_info, server_name=server_name, premiere_year=premiere_year)
             elif event_info.event in (
                 "library.deleted", "library.removed", "item.deleted",
-                "item.removed", "ItemRemoved", "ItemDeleted",
+                "item.removed", "ItemRemoved", "ItemDeleted", "deep.delete",
             ):
+                # 神医助手「深度删除」：原报文再转投一次 MoviePilot 的 Webhook 链，
+                # 让 115strm助手（P115StrmHelper）等插件按自己的开关同步删除网盘文件
+                # （是否需要删由对方的配置决定，本插件不另加开关）
+                if str(event_info.event) == "deep.delete":
+                    self._forward_deep_delete(message)
                 self._dispatch_deleted(event_info, server_name=server_name)
             elif event_info.event:
                 # 其余事件（播放/暂停/用户/系统/任务等）走通用事件通知
@@ -903,6 +2083,115 @@ class embyxiaoluo(_PluginBase):
             return ""
         return f"https://{self._tmdb_image_domain}/t/p/{size}{path}"
 
+    # ---------- 类别：按 TMDB 出品地区判定（本地改版新增） ----------
+
+    # 华语地区
+    REGION_CN = {"CN", "HK", "TW", "MO"}
+    # 日韩
+    REGION_JPKR = {"JP", "KR"}
+    # 欧美（北美 + 欧洲 + 拉美 + 大洋洲等）
+    REGION_WEST = {
+        "US", "GB", "CA", "AU", "NZ", "IE", "DE", "FR", "IT", "ES", "PT", "NL",
+        "BE", "CH", "AT", "SE", "NO", "DK", "FI", "IS", "PL", "CZ", "SK", "HU",
+        "RO", "GR", "RU", "UA", "EE", "LV", "LT", "HR", "RS", "BG", "SI", "LU",
+        "MT", "CY", "MX", "AR", "BR", "CL", "CO", "PE", "UY", "VE", "ZA", "IL",
+        "TR",
+    }
+    # 出品国家取不到时的语言兜底
+    LANG_TO_REGION = {
+        "zh": "cn", "cn": "cn", "ja": "jpkr", "ko": "jpkr",
+        "en": "west", "de": "west", "fr": "west", "es": "west", "it": "west",
+        "pt": "west", "ru": "west", "nl": "west", "sv": "west", "no": "west",
+        "da": "west", "fi": "west", "pl": "west", "cs": "west", "el": "west",
+        "hu": "west", "tr": "west", "he": "west",
+    }
+
+    @classmethod
+    def _region_label(cls, data: dict, is_ep: bool) -> str:
+        """
+        按 TMDB 出品地区给出「类别」：国产剧 / 日韩剧 / 欧美剧 / 其他剧（电影同理）。
+
+        判定顺序：出品国家（origin_country + production_countries）优先，取不到再用
+        original_language 兜底；两者都没有则返回空串（由调用方回落到 Emby 库名）。
+        剧集且类型含「动画」时细分为 **国漫** / **日番**（动画电影仍按地区给「…电影」）。
+
+        :param data: TMDB 详情对象（tv / movie）
+        :param is_ep: 是否剧集（决定后缀「剧」还是「电影」）
+        :return str: 类别文字；无法判断时返回空串
+        """
+
+        codes = {str(code).upper() for code in (data.get("origin_country") or []) if code}
+        for country in data.get("production_countries") or []:
+            code = str((country or {}).get("iso_3166_1") or "").upper()
+            if code:
+                codes.add(code)
+        lang = str(data.get("original_language") or "").strip().lower()
+        # 动画剧集单独归类（国漫 / 日番），番剧语义只对剧集成立
+        if is_ep and cls._is_animation(data):
+            if "JP" in codes or (not codes and lang == "ja"):
+                return "日番"
+            if codes & cls.REGION_CN or (not codes and lang in ("zh", "cn")):
+                return "国漫"
+
+        region = ""
+        if codes & cls.REGION_CN:
+            region = "cn"
+        elif codes & cls.REGION_JPKR:
+            region = "jpkr"
+        elif codes & cls.REGION_WEST:
+            region = "west"
+        elif lang:
+            region = cls.LANG_TO_REGION.get(lang, "")
+        if not region and not codes and not lang:
+            return ""
+        suffix = "剧" if is_ep else "电影"
+        names = {
+            "cn": f"国产{suffix}",
+            "jpkr": f"日韩{suffix}",
+            "west": f"欧美{suffix}",
+        }
+        return names.get(region, f"其他{suffix}")
+
+    # TMDB 的「动画」类型 ID 固定为 16；名称按语言本地化，所以两种都认
+    ANIMATION_GENRE_IDS = {"16"}
+    ANIMATION_GENRE_NAMES = {"animation", "anime", "动画", "動畫", "动漫", "動漫"}
+
+    @classmethod
+    def _is_animation(cls, data: dict) -> bool:
+        """
+        判断 TMDB 详情是否属于动画（类型含 Animation / 动画）。
+
+        :param data: TMDB 详情对象
+        :return bool: 是动画返回 True
+        """
+
+        for genre in data.get("genres") or []:
+            item = genre or {}
+            if str(item.get("id") or "") in cls.ANIMATION_GENRE_IDS:
+                return True
+            name = str(item.get("name") or "").strip().lower()
+            if name in cls.ANIMATION_GENRE_NAMES:
+                return True
+        return False
+
+    def _fetch_tmdb_region(self, tmdb_id: str, is_ep: bool) -> str:
+        """
+        只取「类别」需要的出品地区（一次 TMDB 详情请求，不拉演职员/剧照）。
+
+        删除通知里 Emby 条目可能已不可读，但仍要显示 国产剧/欧美剧 这类类别。
+
+        :param tmdb_id: TMDB ID
+        :param is_ep: 是否剧集
+        :return str: 类别文字；取不到返回空串
+        """
+
+        if not tmdb_id or not self._enable_tmdb or not self._tmdb_api_key:
+            return ""
+        data = self._tmdb_request(f"{'/tv' if is_ep else '/movie'}/{tmdb_id}")
+        if not data:
+            return ""
+        return self._region_label(data, is_ep)
+
     def _search_tmdb_id(self, name: str, media_type: str, year: str = "") -> str:
         """当 ProviderIds 无 Tmdb 时，按名称搜索 TMDB 获取 ID"""
         if not self._tmdb_api_key or not name:
@@ -928,6 +2217,10 @@ class embyxiaoluo(_PluginBase):
             "genres": "", "cast": "", "rating": "",
             "release_date": "", "poster_url": "",
             "backdrop_url": "", "still_url": "", "overview_tmdb": "",
+            # 类别（国产剧 / 日韩剧 / 欧美剧…）：按 TMDB 出品地区判定
+            "region": "",
+            # 单集标题 / 单集简介 / 整季剧简介（本地改版新增）
+            "episode_title": "", "episode_overview": "", "series_overview": "",
         }
         if not tmdb_id or not self._enable_tmdb or not self._tmdb_api_key:
             return meta
@@ -951,6 +2244,7 @@ class embyxiaoluo(_PluginBase):
             genres = data.get("genres", [])
             if genres:
                 meta["genres"] = ", ".join(GENRE_MAP.get(g["name"], g["name"]) for g in genres[:3])
+            meta["region"] = self._region_label(data, False)
             if data.get("poster_path"):
                 meta["poster_url"] = self._tmdb_image_url(data["poster_path"])
             if data.get("backdrop_path"):
@@ -965,11 +2259,14 @@ class embyxiaoluo(_PluginBase):
         if tv:
             meta["rating"] = str(tv.get("vote_average", ""))
             meta["release_date"] = tv.get("first_air_date", "")
+            # 整部剧的简介单独留一份，单集简介不会把它覆盖掉
+            meta["series_overview"] = str(tv.get("overview") or "")
             if not meta.get("overview_tmdb"):
                 meta["overview_tmdb"] = tv.get("overview", "")
             genres = tv.get("genres", [])
             if genres:
                 meta["genres"] = ", ".join(GENRE_MAP.get(g["name"], g["name"]) for g in genres[:3])
+            meta["region"] = self._region_label(tv, True)
             if tv.get("poster_path"):
                 meta["poster_url"] = self._tmdb_image_url(tv["poster_path"])
             if tv.get("backdrop_path"):
@@ -993,6 +2290,8 @@ class embyxiaoluo(_PluginBase):
                 s, e = int(season_id), int(episode_id)
                 ep_data = self._tmdb_request(f"/tv/{tmdb_id}/season/{s}/episode/{e}")
                 if ep_data:
+                    meta["episode_title"] = str(ep_data.get("name") or "")
+                    meta["episode_overview"] = str(ep_data.get("overview") or "")
                     if ep_data.get("air_date"):
                         meta["release_date"] = ep_data["air_date"]
                     if ep_data.get("overview"):
@@ -1128,6 +2427,119 @@ class embyxiaoluo(_PluginBase):
         self._emby_uid_cache = (host, uid)
         return uid
 
+    # ==================== 媒体库（类别）解析（本地改版新增） ====================
+
+    LIBRARY_CACHE_TTL = 300
+
+    def _emby_library_index(self) -> List[Tuple[str, str]]:
+        """
+        返回 Emby 媒体库索引 ``[(库根路径, 库名)]``（5 分钟内复用缓存）。
+
+        Emby Webhook 报文里通常没有库名，只能反查：先取媒体库根路径，再用条目
+        路径做前缀匹配。这样通知里的「类别」才会是 国产剧 / 欧美剧 这类库名，
+        而不是空的。
+
+        :return List[Tuple[str, str]]: 按路径长度倒序的索引；取不到时为空列表
+        """
+
+        host, apikey = self._emby_credentials
+        if not (host and apikey):
+            return []
+        cached = getattr(self, "_emby_lib_cache", None)
+        now = time.time()
+        if cached and cached[0] == host and now - cached[1] < self.LIBRARY_CACHE_TTL:
+            return cached[2]
+        index: List[Tuple[str, str]] = []
+        try:
+            res = requests.get(
+                f"{host}/Library/VirtualFolders",
+                params={"api_key": apikey},
+                timeout=10,
+            )
+            if res.status_code == 200:
+                for folder in res.json() or []:
+                    name = str(folder.get("Name") or "").strip()
+                    if not name:
+                        continue
+                    for location in folder.get("Locations") or []:
+                        loc = str(location or "").replace("\\", "/").rstrip("/")
+                        if loc:
+                            index.append((loc, name))
+            else:
+                logger.debug(f"EmbyNotify 读取媒体库列表返回 HTTP {res.status_code}")
+        except Exception as e:  # pylint: disable=broad-except
+            logger.debug(f"EmbyNotify 读取媒体库列表失败：{e}")
+        # 长路径优先，避免 /影视城/电影 抢走 /影视城/电影/国产电影
+        index.sort(key=lambda item: len(item[0]), reverse=True)
+        self._emby_lib_cache = (host, now, index)
+        return index
+
+    def _library_by_path(self, path: str) -> str:
+        """
+        用条目文件路径反查所属媒体库名。
+
+        :param path: 条目路径（Emby 返回的 Path 或 Webhook 带的 Path）
+        :return str: 库名；匹配不到返回空串
+        """
+
+        raw = str(path or "").replace("\\", "/").rstrip("/")
+        if not raw:
+            return ""
+        for location, name in self._emby_library_index():
+            if raw == location or raw.startswith(location + "/"):
+                return name
+        return ""
+
+    def _library_by_ancestors(self, item_id: str) -> str:
+        """
+        沿 Emby 祖先链找媒体库根（CollectionFolder）的名字。
+
+        条目路径拿不到时（例如 Emby 没返回 Path）作为兜底。
+
+        :param item_id: Emby 条目 ID
+        :return str: 库名；取不到返回空串
+        """
+
+        host, apikey = self._emby_credentials
+        if not (item_id and host and apikey):
+            return ""
+        try:
+            res = requests.get(
+                f"{host}/Items/{item_id}/Ancestors",
+                params={"api_key": apikey, "userId": self._emby_user_id(host, apikey)},
+                timeout=10,
+            )
+            if res.status_code == 200:
+                for ancestor in reversed(res.json() or []):
+                    if str(ancestor.get("Type") or "") == "CollectionFolder":
+                        name = str(ancestor.get("Name") or "").strip()
+                        if name:
+                            return name
+        except Exception as e:  # pylint: disable=broad-except
+            logger.debug(f"EmbyNotify 读取条目祖先链失败：{e}")
+        return ""
+
+    def _resolve_library(self, info: WebhookEventInfo, item: dict) -> str:
+        """
+        解析通知里的「类别」（Emby 媒体库名）。
+
+        优先级：Webhook 自带库名 → 条目路径前缀匹配媒体库根 → 条目祖先链。
+        不再用 ``CollectionName``：那是「合集」名（如漫威电影宇宙），不是媒体库。
+
+        :param info: Webhook 事件信息
+        :param item: Emby 条目详情（可为空字典）
+        :return str: 库名；都取不到返回空串
+        """
+
+        name = str((info.json_object or {}).get("library") or "").strip()
+        if name:
+            return name
+        path = str(info.item_path or (item or {}).get("Path") or "")
+        name = self._library_by_path(path)
+        if name:
+            return name
+        return self._library_by_ancestors(str(info.item_id or ""))
+
     @staticmethod
     def _format_duration(ticks) -> str:
         """Emby RunTimeTicks → 分钟数。"""
@@ -1157,9 +2569,12 @@ class embyxiaoluo(_PluginBase):
         )
 
     @staticmethod
-    def _default_deleted_tg_template() -> str:
+    def _default_deleted_tg_title() -> str:
+        return "🗑 媒体已删除"
+
+    @staticmethod
+    def _default_deleted_tg_body() -> str:
         return (
-            "🗑 <b>媒体已删除</b>\n\n"
             "<b>{{item_name}}</b>\n{{episode_text}}\n"
             "原名：{{original_title}}\n\n"
             "🖥️ 服务器：{{server_name}}\n"
@@ -1167,13 +2582,30 @@ class embyxiaoluo(_PluginBase):
             "🕐 删除时间：{{added_at}}"
         )
 
+    @classmethod
+    def _default_deleted_tg_template(cls) -> str:
+        """兼容旧名：删除通知的 TG 完整模板（标题 + 正文）。"""
+        return f"{cls._default_deleted_tg_title()}\n\n{cls._default_deleted_tg_body()}"
+
     def _send_telegram_text(self, media: dict) -> None:
         """发送纯文本 Telegram 消息（删除通知用，不带封面）。"""
         token = self._effective_tg_token
         chat_id = self._effective_tg_chat_id
         if not (token and chat_id):
             return
-        text = self._render_template(self._default_deleted_tg_template(), media, escape_html=True)
+        # 删除通知模板可自定义（界面「删除通知」场景）；留空回落到内置默认
+        title = self._render_template(
+            self._del_tg_title_template or self._default_deleted_tg_title(),
+            media,
+            escape_html=True,
+        ).strip()
+        body = self._edge_strip(self._render_template(
+            self._del_tg_body_template or self._default_deleted_tg_body(),
+            media,
+            escape_html=True,
+        ))
+        text = self._edge_strip(f"{title}\n\n{body}") if title else body
+        text = self._keep_spaces(self._drop_empty_label_lines(text))
         try:
             res = requests.post(
                 f"{self._effective_tg_api_host}/bot{token}/sendMessage",
@@ -1217,6 +2649,45 @@ class embyxiaoluo(_PluginBase):
         "series.added": "新增剧集",
         "season.added": "新增季",
         "episode.added": "新增单集",
+        # Emby 系统/任务/插件类事件
+        "scheduledtasks.completed": "定时任务完成",
+        "scheduledtasks.started": "定时任务开始",
+        "scheduledtasks.cancelled": "定时任务已取消",
+        "scheduledtasks.failed": "定时任务失败",
+        "task.started": "任务开始",
+        "task.cancelled": "任务已取消",
+        "task.failed": "任务失败",
+        "plugins.pluginupdated": "插件已更新",
+        "plugins.plugininstalled": "插件已安装",
+        "plugins.pluginuninstalled": "插件已卸载",
+        "system.updateavailable": "Emby 有可用更新",
+        "system.serverrestartrequired": "Emby 需要重启",
+        "user.passwordchanged": "用户修改密码",
+        "user.authenticated": "用户登录验证",
+        "user.lockedout": "用户被锁定",
+        "library.added": "媒体库已添加",
+        "library.removed": "媒体库已移除",
+        "item.added": "条目已添加",
+        "item.removed": "条目已移除",
+    }
+
+    # 未知事件按「主类型.动作」拆分翻译（例如 foo.bar → Foo · Bar）
+    EVENT_SEGMENTS: Dict[str, str] = {
+        "scheduledtasks": "定时任务", "plugins": "插件", "system": "系统",
+        "user": "用户", "playback": "播放", "library": "媒体库", "item": "条目",
+        "task": "任务", "series": "剧集", "season": "季", "episode": "单集",
+        "report": "报告", "notification": "通知", "webhook": "Webhook",
+    }
+    EVENT_ACTIONS: Dict[str, str] = {
+        "completed": "完成", "started": "开始", "cancelled": "已取消", "canceled": "已取消",
+        "failed": "失败", "updated": "更新", "created": "创建", "deleted": "删除",
+        "added": "新增", "removed": "移除", "installed": "安装", "uninstalled": "卸载",
+        "progress": "进度", "start": "开始播放", "stop": "停止播放", "pause": "暂停",
+        "unpause": "继续播放", "authenticated": "登录验证", "lockedout": "被锁定",
+        "passwordchanged": "修改密码", "pluginupdated": "插件更新",
+        "updateavailable": "有可用更新", "serverrestartrequired": "需要重启",
+        "notificationtest": "通知测试", "webhooktest": "Webhook 测试",
+        "export": "导出", "import": "导入", "refresh": "刷新", "scan": "扫描",
     }
 
     @staticmethod
@@ -1252,16 +2723,53 @@ class embyxiaoluo(_PluginBase):
 
     @classmethod
     def _event_text(cls, event: str) -> str:
-        """事件名转成可读中文，未知事件原样显示。"""
-        return cls.EVENT_TEXTS.get(str(event or ""), str(event or "事件通知"))
+        """
+        事件名转成可读中文。已知事件查表；未知事件按「类型.动作」拆分翻译，
+        实在认不出时带上「事件：」前缀和原始 ID，避免只看到一串英文。
+        """
+        raw = str(event or "").strip()
+        if not raw:
+            return "事件通知"
+        if raw in cls.EVENT_TEXTS:
+            return cls.EVENT_TEXTS[raw]
+        parts = [p for p in re.split(r"[.\-_]", raw) if p]
+        labels = []
+        for index, part in enumerate(parts):
+            key = part.lower()
+            if index == 0:
+                labels.append(cls.EVENT_SEGMENTS.get(key, part))
+            else:
+                labels.append(cls.EVENT_ACTIONS.get(key) or cls.EVENT_SEGMENTS.get(key) or part)
+        text = " · ".join(labels).strip()
+        return f"{text}（{raw}）" if text else f"事件：{raw}"
 
     @staticmethod
     def _default_event_feishu_title_template() -> str:
-        return "📢 {{event_text}} · {{item_name}}"
+        return "📢 {{event_text}}"
 
     @staticmethod
     def _default_event_feishu_body_template() -> str:
         return (
+            "📢 **事件**：{{event_text}}\n"
+            "📝 **详情**：{{event_detail}}\n"
+            "📺 **条目**：{{item_name}}{{episode_text}}\n"
+            "👤 **用户**：{{user_name}}\n"
+            "🖥️ **设备**：{{device_name}}\n"
+            "🌐 **IP**：{{ip_text}}\n"
+            "⏱️ **进度**：{{progress}}\n"
+            "📝 **剧情**：{{overview}}\n"
+            "🕐 **时间**：{{added_at}}"
+        )
+
+    @staticmethod
+    def _default_event_tg_title_template() -> str:
+        return "📢 <b>{{event_text}}</b>"
+
+    @staticmethod
+    def _default_event_tg_body_template() -> str:
+        return (
+            "📢 事件：{{event_text}}\n"
+            "📝 详情：{{event_detail}}\n"
             "📺 条目：{{item_name}}{{episode_text}}\n"
             "👤 用户：{{user_name}}\n"
             "🖥️ 设备：{{device_name}}\n"
@@ -1271,21 +2779,33 @@ class embyxiaoluo(_PluginBase):
             "🕐 时间：{{added_at}}"
         )
 
-    @staticmethod
-    def _default_event_tg_title_template() -> str:
-        return "📢 <b>{{event_text}}</b> · {{item_name}}"
+    def _event_detail(self, event: str) -> str:
+        """
+        系统类事件从 Emby 活动日志取一句详情（例如「扫描媒体库 已完成」）。
 
-    @staticmethod
-    def _default_event_tg_body_template() -> str:
-        return (
-            "📺 {{item_name}}{{episode_text}}\n"
-            "👤 用户：{{user_name}}\n"
-            "🖥️ 设备：{{device_name}}\n"
-            "🌐 IP：{{ip_text}}\n"
-            "⏱️ 进度：{{progress}}\n"
-            "📝 剧情：{{overview}}\n"
-            "🕐 时间：{{added_at}}"
-        )
+        :param event: 事件名
+        :return str: 详情；取不到为空串
+        """
+        if not re.match(r"^(scheduledtasks|plugins|system|task)\.", event or "", re.IGNORECASE):
+            return ""
+        now = time.time()
+        cache = getattr(self, "_event_detail_cache", None) or {}
+        cached = cache.get(event)
+        if cached and now - cached[0] < 8:
+            return cached[1]
+        detail = ""
+        data = self._emby_json("/System/ActivityLog/Entries", {"Limit": 30}) or {}
+        for entry in data.get("Items") or []:
+            if str(entry.get("Type") or "") != event:
+                continue
+            when = self._parse_emby_time(str(entry.get("Date") or ""))
+            if when is None or abs((datetime.now(self.REPORT_TZ) - when).total_seconds()) > 300:
+                continue
+            detail = str(entry.get("Name") or "").strip()
+            break
+        cache[event] = (now, detail)
+        self._event_detail_cache = cache
+        return detail
 
     def _dispatch_event(self, info: WebhookEventInfo, server_name: str = "") -> None:
         """通用事件通知：Emby 里勾选的事件都按这里推送。"""
@@ -1341,6 +2861,7 @@ class embyxiaoluo(_PluginBase):
         media = {
             "event": event,
             "event_text": self._event_text(event),
+            "event_detail": self._event_detail(event),
             "item_name": info.item_name or "",
             "item_type": info.item_type or "",
             "is_ep": is_ep,
@@ -1363,6 +2884,9 @@ class embyxiaoluo(_PluginBase):
             "tmdb_url": tmdb_url,
             "tmdb_id": tmdb_id,
             "channel": info.channel or "",
+            "category": "电视剧" if is_ep else "电影",
+            "library": tmdb_meta.get("region") or self._resolve_library(info, emby_item),
+            "emby_library": self._resolve_library(info, emby_item),
         }
         logger.info(
             f"Emby入库通知 事件通知：{media['event_text']} · {media['item_name']}"
@@ -1384,9 +2908,9 @@ class embyxiaoluo(_PluginBase):
             title = self._render_template(
                 self._event_tg_title_template or self._default_event_tg_title_template(), media, escape_html=True
             ).strip()
-            body = self._render_template(
+            body = self._edge_strip(self._render_template(
                 self._event_tg_body_template or self._default_event_tg_body_template(), media, escape_html=True
-            ).strip()
+            ))
             self._send_tg_text(title, body, media)
 
     def _send_tg_text(self, title: str, body: str, media: dict) -> None:
@@ -1396,7 +2920,8 @@ class embyxiaoluo(_PluginBase):
         if not (token and chat_id):
             return
         api = self._effective_tg_api_host
-        text = f"{title}\n\n{body}".strip()
+        text = self._edge_strip(f"{title}\n\n{body}")
+        text = self._keep_spaces(self._drop_empty_label_lines(text))
         photo = str(media.get("image_url") or "")
         name = media.get("item_name") or media.get("event_text") or ""
         try:
@@ -1446,6 +2971,41 @@ class embyxiaoluo(_PluginBase):
         except Exception as e:  # pylint: disable=broad-except
             logger.error(f"Emby入库通知 Telegram 事件通知异常：{e}")
 
+    def _forward_deep_delete(self, payload: dict) -> None:
+        """
+        把神医助手的 ``deep.delete`` 原报文转投 MoviePilot 的 Webhook 链。
+
+        背景：115strm助手（P115StrmHelper）的「同步删除」监听的是 MoviePilot 的
+        ``WebhookMessage`` 事件，而且只处理 ``Event == "deep.delete"`` 的报文；
+        本插件自己的 ``/plugin/embyxiaoluo/webhook`` 端点不在那条链上，
+        所以收到 deep.delete 时在这里再投一次，由 MoviePilot 统一解析并发出事件。
+        是否真的删除网盘文件由对方的开关与路径映射决定，本插件不做判断。
+
+        :param payload: 神医助手发来的原始 Webhook 报文
+        """
+
+        if not isinstance(payload, dict) or not payload:
+            return
+
+        def _run() -> None:
+            try:
+                from app.chain.webhook import WebhookChain
+
+                form = {"data": json.dumps(payload, ensure_ascii=False)}
+                args: Dict[str, Any] = {}
+                if self._emby_server_name:
+                    args["source"] = self._emby_server_name
+                WebhookChain().message(body=None, form=form, args=args)
+                item = payload.get("Item") or {}
+                logger.info(
+                    f"Emby入库通知 已把 deep.delete 转投 MoviePilot 事件链："
+                    f"{item.get('Name') or item.get('Path') or ''}"
+                )
+            except Exception as e:  # pylint: disable=broad-except
+                logger.error(f"Emby入库通知 转投 deep.delete 到 MoviePilot 失败：{e}")
+
+        threading.Thread(target=_run, daemon=True).start()
+
     def _dispatch_deleted(self, info: WebhookEventInfo, server_name: str = "") -> None:
         """处理媒体删除事件（library.deleted / ItemRemoved）。"""
         is_ep = info.item_type in ("TV", "SHOW", "Episode")
@@ -1455,6 +3015,9 @@ class embyxiaoluo(_PluginBase):
         elif is_ep and info.season_id:
             episode_text = f"第{info.season_id}季"
         item = self._fetch_emby_item(info.item_id or "")
+        emby_library = self._resolve_library(info, item)
+        # 删除通知也按 TMDB 出品地区给类别（条目可能已不存在，用 info 带的 TMDB ID）
+        region = self._fetch_tmdb_region(str(info.tmdb_id or ""), is_ep)
         media = {
             "item_name": info.item_name or "",
             "item_type": info.item_type or "",
@@ -1479,10 +3042,15 @@ class embyxiaoluo(_PluginBase):
             "still_url": "",
             "file_path": info.item_path or str(item.get("Path") or ""),
             "added_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "library": str((info.json_object or {}).get("library") or ""),
+            "library": region or emby_library,
+            "emby_library": emby_library,
             "original_title": str(item.get("OriginalTitle") or ""),
             "duration": self._format_duration(item.get("RunTimeTicks")),
+            "category": "电视剧" if is_ep else "电影",
             "type_text": "剧集" if is_ep else "电影",
+            "episode_title": "",
+            "episode_overview": "",
+            "series_overview": "",
             "year": str(item.get("ProductionYear") or ""),
             "is_deleted": True,
         }
@@ -1523,7 +3091,19 @@ class embyxiaoluo(_PluginBase):
         duration = self._format_duration(emby_item.get("RunTimeTicks"))
         year = str(emby_item.get("ProductionYear") or "")
         type_text = "剧集" if is_ep else "电影"
-        overview = info.overview or tmdb_meta.get("overview_tmdb", "") or str(emby_item.get("Overview") or "") or ""
+        # 类别：TMDB 出品地区（国产剧/日韩剧/欧美剧）优先，取不到才回落 Emby 库名
+        emby_library = self._resolve_library(info, emby_item)
+        region = str(tmdb_meta.get("region") or "")
+        # 单集标题/简介只取单集自身的数据（emby_item 在剧集场景下是整部剧，不能拿来当单集信息）
+        episode_title, episode_overview, series_overview = self._episode_fields(
+            tmdb_meta, info, emby_item
+        )
+        if is_ep:
+            # 简介 = 该集简介；没有就空着。整剧简介请用 {{series_overview}}
+            overview = episode_overview
+        else:
+            overview = info.overview or tmdb_meta.get("overview_tmdb", "") or \
+                str(emby_item.get("Overview") or "") or ""
         # 封面：Emby 优先，且横版优先（竖版海报只作最后兜底，避免通知里出现大竖图）
         emby_host, emby_key = self._emby_credentials
         emby_primary = ""
@@ -1612,6 +3192,8 @@ class embyxiaoluo(_PluginBase):
         media = {
             "item_name": info.item_name or "", "item_type": info.item_type or "",
             "is_ep": is_ep, "status_text": status_text, "episode_text": episode_text,
+            "episode_title": episode_title, "episode_overview": episode_overview,
+            "series_overview": series_overview,
             "overview": overview, "image_url": image_url, "server_name": display_name,
             "channel": info.channel or "", "play_url": play_url, "detail_url": detail_url, "tmdb_url": tmdb_url,
             "tmdb_id": info.tmdb_id or "", "season_id": info.season_id, "episode_id": info.episode_id,
@@ -1623,10 +3205,12 @@ class embyxiaoluo(_PluginBase):
             "still_url": tmdb_meta.get("still_url", ""),
             "file_path": info.item_path or str(emby_item.get("Path") or ""),
             "added_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "library": str((info.json_object or {}).get("library") or "")
-                       or str(emby_item.get("CollectionName") or ""),
+            "library": region or emby_library,
+            "emby_library": emby_library,
             "original_title": original_title,
             "duration": duration,
+            # 分类 = 电影/电视剧；类别（library）= TMDB 出品地区；类型（genres）= 剧情等
+            "category": "电视剧" if is_ep else "电影",
             "type_text": type_text,
             "year": year,
         }
@@ -1751,6 +3335,82 @@ class embyxiaoluo(_PluginBase):
             episode_en = f"E{start:02d}"
         return season_cn, season_en, episode_cn, episode_en
 
+    def _added_templates(self, channel: str, is_ep: bool) -> Tuple[str, str]:
+        """
+        取「入库通知」要用的标题/正文模板（按渠道与媒体类型）。
+
+        默认电影与剧集共用一套（老行为）；开启 ``split_by_type`` 后电影单独用
+        ``*_movie_*``，该组留空时仍回落到共用模板，避免刚打开开关时通知变空。
+
+        :param channel: ``telegram`` 或 ``feishu``
+        :param is_ep: 是否剧集
+        :return Tuple[str, str]: ``(标题模板, 正文模板)``
+        """
+
+        if channel == "telegram":
+            shared = (self._tg_title_template, self._tg_body_template)
+            movie = (self._tg_movie_title_template, self._tg_movie_body_template)
+        else:
+            shared = (self._feishu_title_template, self._feishu_body_template)
+            movie = (self._feishu_movie_title_template, self._feishu_movie_body_template)
+        if not is_ep and self._split_by_type and (movie[0] or movie[1]):
+            return (movie[0] or shared[0], movie[1] or shared[1])
+        return shared
+
+    # TMDB 没有单集译名时的占位标题（如「第 22 集」「Episode 22」「S01E22」）
+    GENERIC_EPISODE_TITLE_RE = re.compile(
+        r"^\s*(?:第\s*\d+\s*集|Episode\s*\d+|S\d+\s*E\d+)\s*$", re.IGNORECASE
+    )
+
+    @classmethod
+    def _is_generic_episode_title(cls, text: str) -> bool:
+        """
+        判断单集标题是不是「占位式」（只有集号，没有真实标题）。
+
+        :param text: 标题
+        :return bool: 是占位标题返回 True
+        """
+
+        return bool(cls.GENERIC_EPISODE_TITLE_RE.match(str(text or "")))
+
+    def _episode_fields(
+        self, tmdb_meta: dict, info: WebhookEventInfo, emby_item: dict
+    ) -> Tuple[str, str, str]:
+        """
+        组装单集标题 / 单集简介 / 整剧简介，三者互不串用。
+
+        关键点：剧集事件里 ``info.item_id`` 存的是**剧集** ID（封面、详情要用），
+        所以 ``emby_item`` 其实是整部剧，不能拿它的 Name/Overview 当单集信息——
+        单集自己的标题/简介从 Webhook 报文的 ``Item`` 里取（解析时存在 json_object）。
+
+        :param tmdb_meta: TMDB 元数据
+        :param info: Webhook 事件信息
+        :param emby_item: Emby 条目详情（剧集场景下是「剧集」）
+        :return Tuple[str, str, str]: (单集标题, 单集简介, 整剧简介)
+        """
+
+        extra = dict(info.json_object or {})
+        is_ep = info.item_type in ("TV", "SHOW", "Episode")
+        if not is_ep:
+            return "", "", ""
+        series_overview = str(tmdb_meta.get("series_overview") or "").strip()
+        if not series_overview:
+            series_overview = str((emby_item or {}).get("Overview") or "").strip()
+
+        tmdb_title = str(tmdb_meta.get("episode_title") or "").strip()
+        emby_title = str(extra.get("episode_name") or "").strip()
+        if self._is_generic_episode_title(tmdb_title) and emby_title \
+                and not self._is_generic_episode_title(emby_title):
+            # TMDB 只有「第 N 集」，而 Emby 有真实集名时优先 Emby
+            title = emby_title
+        else:
+            title = tmdb_title or emby_title
+        overview = (
+            str(tmdb_meta.get("episode_overview") or "").strip()
+            or str(extra.get("episode_overview") or "").strip()
+        )
+        return title, overview, series_overview
+
     def _template_context(self, media: dict) -> dict:
         play_url = str(media.get("play_url") or "")
         tmdb_url = str(media.get("tmdb_url") or "")
@@ -1765,6 +3425,9 @@ class embyxiaoluo(_PluginBase):
             "status_text": media.get("status_text", ""),
             "item_name": media.get("item_name", ""),
             "episode_text": media.get("episode_text", ""),
+            "episode_title": media.get("episode_title", ""),
+            "episode_overview": media.get("episode_overview", ""),
+            "series_overview": media.get("series_overview", ""),
             "genres": media.get("genres", ""),
             "cast": media.get("cast", ""),
             "rating": media.get("rating", ""),
@@ -1775,7 +3438,9 @@ class embyxiaoluo(_PluginBase):
             "channel": media.get("channel", ""),
             "file_path": media.get("file_path", ""),
             "added_at": media.get("added_at", ""),
+            "category": media.get("category", ""),
             "library": media.get("library", ""),
+            "emby_library": media.get("emby_library", ""),
             "original_title": media.get("original_title", ""),
             "duration": media.get("duration", ""),
             "type_text": media.get("type_text", ""),
@@ -1793,6 +3458,7 @@ class embyxiaoluo(_PluginBase):
             "episode_code": self._episode_code(media),
             "event": media.get("event", ""),
             "event_text": media.get("event_text", ""),
+            "event_detail": media.get("event_detail", ""),
             "user_name": media.get("user_name", ""),
             "device_name": media.get("device_name", ""),
             "client": media.get("client", ""),
@@ -1824,13 +3490,17 @@ class embyxiaoluo(_PluginBase):
         type_text = media.get("genres") or ("剧集" if media.get("is_ep") else "电影")
         date_label = "📺 首播" if media.get("is_ep") else "🎬 上映"
         release_date = media.get("release_date", "") or "Unknown"
+        tpl_title, tpl_body = self._added_templates("telegram", bool(media.get("is_ep")))
         title = self._render_template(
-            self._tg_title_template or self._default_tg_title_template(), media, escape_html=True
+            tpl_title or self._default_tg_title_template(), media, escape_html=True
         ).strip()
-        body = self._render_template(
-            self._tg_body_template or self._default_tg_body_template(), media, escape_html=True
-        ).strip()
-        caption = f"{title}\n\n{body}".strip() if title else body
+        body = self._edge_strip(self._render_template(
+            tpl_body or self._default_tg_body_template(), media, escape_html=True
+        ))
+        caption = self._edge_strip(f"{title}\n\n{body}") if title else body
+        # 变量为空时整行隐藏（单集标题/简介缺失、电影没有原名等），再保留用户敲的空格缩进
+        caption = self._drop_empty_label_lines(caption)
+        caption = self._keep_spaces(caption)
         # 构建 InlineKeyboard 按钮（Telegram 仅支持 http/https URL）
         buttons = []
         play_url = media.get("play_url", "")
@@ -2096,12 +3766,14 @@ class embyxiaoluo(_PluginBase):
         text = re.sub(r"<text_tag\b[^>]*>\s*</text_tag>", "", text, flags=re.IGNORECASE)
         rows: List[str] = []
         for line in (text or "").splitlines():
-            raw = line.strip()
-            if not raw:
+            # 保留行首空格：用户会用空格把内容往右挪对齐/居中，不能被 strip 吃掉
+            raw = line.rstrip()
+            content = raw.strip()
+            if not content:
                 rows.append("")
                 continue
             # 判断内容是否为空时忽略样式标签本身
-            plain = re.sub(r"</?(?:font|text_tag)\b[^>]*>", "", raw).strip().lstrip("*").strip()
+            plain = re.sub(r"</?(?:font|text_tag)\b[^>]*>", "", content).lstrip("*").strip()
             if not plain:
                 continue
             # 形如「主演：」「播放：」的空字段整行丢弃
@@ -2119,31 +3791,101 @@ class embyxiaoluo(_PluginBase):
             out.append(row)
         while out and not out[-1]:
             out.pop()
-        return "\n".join(out).strip()
+        return "\n".join(out).strip("\n")
+
+    @staticmethod
+    def _keep_spaces(text: str) -> str:
+        """
+        把「行首空格」和「连续 2 个及以上空格」换成不换行空格（NBSP）。
+
+        Telegram（HTML）与飞书卡片都会把连续空格折叠掉，导致用户用空格做的
+        缩进/对齐在通知里消失。这里在发送前统一转换，既保留缩进，也不会影响
+        单词之间的普通单个空格。
+
+        :param text: 已渲染好的正文/标题
+        :return str: 转换后的文本
+        """
+
+        if not text:
+            return text
+        rows: List[str] = []
+        for line in str(text).split("\n"):
+            stripped = line.lstrip(" ")
+            indent = len(line) - len(stripped)
+            if indent:
+                line = "\u00a0" * indent + stripped
+            line = re.sub(r" {2,}", lambda m: "\u00a0" * len(m.group(0)), line)
+            rows.append(line)
+        return "\n".join(rows)
+
+    @staticmethod
+    def _edge_strip(text: str) -> str:
+        """
+        去掉首尾的空行与行尾空白，但**保留行首空格**（用户用来缩进/对齐）。
+
+        :param text: 渲染后的正文
+        :return str: 去掉边缘空行后的正文
+        """
+
+        if not text:
+            return text
+        lines = [line.rstrip() for line in str(text).split("\n")]
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        while lines and not lines[-1].strip():
+            lines.pop()
+        return "\n".join(lines)
+
+    @staticmethod
+    def _drop_empty_label_lines(text: str) -> str:
+        """
+        丢掉「只剩标签 + 冒号」的空行（如多集合并时的「📄 单集标题：」）。
+
+        只在多集合并的通知里调用：单集标题/简介被清空后，模板里的对应行会只剩
+        标签，删掉更干净。普通通知不动，避免误伤用户特意留的空字段。
+
+        :param text: 正文
+        :return str: 清理后的正文
+        """
+
+        if not text:
+            return text
+        rows = [
+            line for line in str(text).split("\n")
+            if not re.fullmatch(r"\s*[^：:\n]{1,20}[：:]\s*", line)
+        ]
+        return "\n".join(rows)
 
     def _build_feishu_card(self, title: str, body: str, image_key: str = "") -> dict:
         """飞书 2.0 卡片：图片贴顶铺满宽度，文字带边距（对齐 MP 自带媒体服务器通知）。"""
         elements: List[dict] = []
+        # 标题区使用 heading 大标题样式，飞书对 heading 里的 ** 加粗标记不解析，
+        # 会把星号原样显示；这里去掉成对的 **，让标题按大标题样式正常呈现。
+        # 去掉首尾空格/全角空格/不换行空格，并强制左对齐：
+        # 部分飞书客户端会把 heading 样式的短标题居中显示，看起来像「标题前面一大片空白」
+        title_text = re.sub(r"\*\*", "", str(title or "")).strip(" \t\u3000\u00a0") or "媒体入库"
         if image_key:
             # 有图时 body 零内边距，图片左右不留白，视觉上就是整条消息的顶部大图
             elements.append({
                 "tag": "img",
                 "img_key": image_key,
                 "mode": "fit_horizontal",
-                "alt": {"tag": "plain_text", "content": title or "封面"},
+                "alt": {"tag": "plain_text", "content": title_text or "封面"},
             })
         title_margin = "12px 12px 0px 12px" if image_key else None
         body_margin = "4px 12px 12px 12px" if image_key else None
         title_section: dict = {
             "tag": "markdown",
             "text_size": "heading",
-            "content": title or "媒体入库",
+            "text_align": "left",
+            "content": title_text,
         }
         if title_margin:
             title_section["margin"] = title_margin
         body_section: dict = {
             "tag": "markdown",
             "text_size": "normal",
+            "text_align": "left",
             "content": body or "新内容已入库",
         }
         if body_margin:
@@ -2155,7 +3897,7 @@ class embyxiaoluo(_PluginBase):
             "config": {
                 "wide_screen_mode": True,
                 "enable_forward": True,
-                "summary": {"content": title or "媒体入库"},
+                "summary": {"content": title_text},
             },
             "body": {
                 "direction": "vertical",
@@ -2169,19 +3911,26 @@ class embyxiaoluo(_PluginBase):
 
         优先横版图（剧照/背景），竖版海报仅作兜底，避免卡片顶部出现大竖图。
         """
-        url = (
-            media.get("image_url") or media.get("still_url")
-            or media.get("backdrop_url") or media.get("poster_url") or ""
-        )
-        if not url.startswith(("http://", "https://")):
+        content = media.get("image_bytes")
+        if not content:
+            url = (
+                media.get("image_url") or media.get("still_url")
+                or media.get("backdrop_url") or media.get("poster_url") or ""
+            )
+            if not url.startswith(("http://", "https://")):
+                return ""
+            try:
+                res = requests.get(url, timeout=20, proxies=self._proxies)
+                content = res.content if res.status_code == 200 else None
+            except Exception as e:  # pylint: disable=broad-except
+                logger.warning(f"Emby入库通知 飞书海报下载失败：{e}")
+                content = None
+        if not content:
             return ""
         path: Optional[Path] = None
         try:
-            res = requests.get(url, timeout=20, proxies=self._proxies)
-            if res.status_code != 200 or not res.content:
-                return ""
             with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as fh:
-                fh.write(res.content)
+                fh.write(content)
                 path = Path(fh.name)
             resp = api.upload_image(path)
             if resp.success():
@@ -2202,17 +3951,23 @@ class embyxiaoluo(_PluginBase):
     def _send_feishu(self, media: dict):
         """按配置的模板渲染并发送一条飞书通知。"""
         if media.get("is_deleted"):
-            title = self._render_template(self._default_deleted_feishu_title(), media).strip()
-            body = self._tidy_feishu_body(
-                self._render_template(self._default_deleted_feishu_body(), media)
-            )
-        else:
+            # 删除通知模板可自定义（界面「删除通知」场景）；留空回落到内置默认
             title = self._render_template(
-                self._feishu_title_template or self._default_feishu_title_template(), media
+                self._del_feishu_title_template or self._default_deleted_feishu_title(), media
             ).strip()
             body = self._tidy_feishu_body(
                 self._render_template(
-                    self._feishu_body_template or self._default_feishu_body_template(), media
+                    self._del_feishu_body_template or self._default_deleted_feishu_body(), media
+                )
+            )
+        else:
+            tpl_title, tpl_body = self._added_templates("feishu", bool(media.get("is_ep")))
+            title = self._render_template(
+                tpl_title or self._default_feishu_title_template(), media
+            ).strip(" \t\u3000\u00a0")
+            body = self._tidy_feishu_body(
+                self._render_template(
+                    tpl_body or self._default_feishu_body_template(), media
                 )
             )
         if not title:
@@ -2224,6 +3979,9 @@ class embyxiaoluo(_PluginBase):
 
     def _send_feishu_app(self, title: str, body: str, media: dict, use_image: bool = True):
         """走飞书自建应用 OpenAPI 发送（复用 MP 飞书渠道或插件内自填凭据）。"""
+        if media.get("episode_merged"):
+            body = self._drop_empty_label_lines(body)
+        body = self._keep_spaces(body)
         app_id = self._effective_feishu_app_id
         app_secret = self._effective_feishu_app_secret
         candidates = self._feishu_candidates()
@@ -2274,6 +4032,9 @@ class embyxiaoluo(_PluginBase):
 
     def _send_feishu_webhook(self, title: str, body: str, media: dict):
         """走飞书群自定义机器人 Webhook 发送。"""
+        if media.get("episode_merged"):
+            body = self._drop_empty_label_lines(body)
+        body = self._keep_spaces(body)
         webhook = self._feishu_webhook
         if not webhook:
             logger.warning("Emby入库通知 未填写飞书群机器人 Webhook，已跳过")
@@ -2357,6 +4118,14 @@ class embyxiaoluo(_PluginBase):
             "telegram": {
                 "title": self._default_tg_title_template(),
                 "body": self._default_tg_body_template(),
+            },
+            "del_feishu": {
+                "title": self._default_deleted_feishu_title(),
+                "body": self._default_deleted_feishu_body(),
+            },
+            "del_telegram": {
+                "title": self._default_deleted_tg_title(),
+                "body": self._default_deleted_tg_body(),
             },
         }
 
@@ -2479,46 +4248,104 @@ class embyxiaoluo(_PluginBase):
         sample = str(params.get("sample") or "tv")
         title_tpl = str(params.get("title_template") or "")
         body_tpl = str(params.get("body_template") or "")
+        # 场景：added=入库通知（默认），deleted=删除通知，event=事件通知
+        scene = str(params.get("scene") or "added").lower()
+        deleted = scene == "deleted"
+        is_event = scene == "event"
+        if scene == "report":
+            return self._send_report_preview(channel, title_tpl, body_tpl)
         media = self._build_test_media(sample)
+        if deleted:
+            media["is_deleted"] = True
+            media["status_text"] = "媒体已删除"
+        if is_event:
+            media["status_text"] = "事件通知"
         try:
-            if channel == "telegram":
-                old = (self._tg_title_template, self._tg_body_template)
-                self._tg_title_template, self._tg_body_template = title_tpl, body_tpl
-                try:
-                    self._send_telegram(media)
-                finally:
-                    self._tg_title_template, self._tg_body_template = old
+            if is_event:
+                # 事件通知：直接用编辑框里的模板渲染后按「事件」文本通道发送
+                title = self._render_template(
+                    title_tpl or self._default_event_tg_title_template()
+                    if channel == "telegram" else
+                    title_tpl or self._default_event_feishu_title_template(),
+                    media,
+                    escape_html=channel == "telegram",
+                ).strip()
+                body = self._render_template(
+                    body_tpl or self._default_event_tg_body_template()
+                    if channel == "telegram" else
+                    body_tpl or self._default_event_feishu_body_template(),
+                    media,
+                    escape_html=channel == "telegram",
+                ).strip()
+                if channel == "telegram":
+                    self._send_tg_text(title, body, media)
+                else:
+                    body = self._tidy_feishu_body(body)
+                    if (self._feishu_mode or "mp").lower() == "webhook":
+                        self._send_feishu_webhook(title, body, media)
+                    else:
+                        self._send_feishu_app(title, body, media)
+            elif channel == "telegram":
+                if deleted:
+                    old_del = (self._del_tg_title_template, self._del_tg_body_template)
+                    self._del_tg_title_template = title_tpl
+                    self._del_tg_body_template = body_tpl
+                    try:
+                        self._send_telegram(media)
+                    finally:
+                        self._del_tg_title_template, self._del_tg_body_template = old_del
+                else:
+                    old = (self._tg_title_template, self._tg_body_template)
+                    self._tg_title_template, self._tg_body_template = title_tpl, body_tpl
+                    try:
+                        self._send_telegram(media)
+                    finally:
+                        self._tg_title_template, self._tg_body_template = old
             else:
-                old = (self._feishu_title_template, self._feishu_body_template)
-                self._feishu_title_template, self._feishu_body_template = title_tpl, body_tpl
-                try:
-                    self._send_feishu(media)
-                finally:
-                    self._feishu_title_template, self._feishu_body_template = old
+                if deleted:
+                    old_del = (self._del_feishu_title_template, self._del_feishu_body_template)
+                    self._del_feishu_title_template = title_tpl
+                    self._del_feishu_body_template = body_tpl
+                    try:
+                        self._send_feishu(media)
+                    finally:
+                        self._del_feishu_title_template, self._del_feishu_body_template = old_del
+                else:
+                    old = (self._feishu_title_template, self._feishu_body_template)
+                    self._feishu_title_template, self._feishu_body_template = title_tpl, body_tpl
+                    try:
+                        self._send_feishu(media)
+                    finally:
+                        self._feishu_title_template, self._feishu_body_template = old
         except Exception as e:  # pylint: disable=broad-except
             logger.error(f"EmbyNotify 测试发送失败：{e}")
             return {"success": False, "message": f"发送失败：{e}", "data": None}
         label = "Telegram" if channel == "telegram" else "飞书"
         sample_label = "电影" if sample == "movie" else "电视剧"
-        return {"success": True, "message": f"已发送{label}（{sample_label}样例）", "data": None}
+        scene_label = "删除通知" if deleted else ("事件通知" if is_event else "入库通知")
+        return {
+            "success": True,
+            "message": f"已发送{label}（{scene_label} · {sample_label}样例）",
+            "data": None,
+        }
 
     # ==================== 测试通知（本地改版新增） ====================
 
     TEST_SAMPLES: Dict[str, Dict[str, Any]] = {
         "movie": {
             "tmdb_id": "299534", "name": "复仇者联盟4：终局之战", "is_ep": False,
-            "library": "电影",
+            "library": "外语电影",
             "file_path": "/影视城/电影/复仇者联盟4：终局之战 (2019)/Avengers.Endgame.2019.mkv",
         },
         "tv": {
             "tmdb_id": "206484", "name": "诛仙", "is_ep": True,
-            "season": "1", "episode": "5", "library": "国产剧",
+            "season": "1", "episode": "5", "library": "国产剧集",
             "file_path": "/影视城/电视剧/诛仙 (2022)/Season 01/诛仙.S01E05.mkv",
         },
     }
 
     SAMPLE_CACHE_TTL = 6 * 3600
-    SAMPLE_CACHE_KEY = "sample_v2_"
+    SAMPLE_CACHE_KEY = "sample_v4_"
 
     def _build_test_media(self, kind: str) -> dict:
         """返回样例媒体：命中插件数据缓存时立即返回，避免每次都等 TMDB。"""
@@ -2604,10 +4431,23 @@ class embyxiaoluo(_PluginBase):
             "is_ep": is_ep,
             "status_text": "测试通知",
             "episode_text": episode_text,
-            "overview": meta.get("overview_tmdb", ""),
+            "episode_title": meta.get("episode_title", ""),
+            "episode_overview": meta.get("episode_overview", ""),
+            "series_overview": meta.get("series_overview", ""),
+            # 与真实通知一致：剧集的「简介」就是单集简介（无则空），不拿整剧简介顶替
+            "overview": meta.get("episode_overview", "") if is_ep else meta.get("overview_tmdb", ""),
             "image_url": image_url,
             "server_name": "测试服务器",
             "channel": "emby",
+            # 事件样例字段：事件通知模板预览/测试都能直接用
+            "event": "playback.start",
+            "event_text": "开始播放",
+            "user_name": "小罗",
+            "device_name": "客厅电视",
+            "client": "Emby Web",
+            "ip": "192.168.1.20",
+            "ip_text": "内网",
+            "progress": "",
             "play_url": play_url,
             "detail_url": detail_url,
             "tmdb_url": (
@@ -2626,7 +4466,9 @@ class embyxiaoluo(_PluginBase):
             "still_url": meta.get("still_url", ""),
             "file_path": sample.get("file_path", ""),
             "added_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "library": sample.get("library", ""),
+            "library": meta.get("region") or sample.get("library", ""),
+            "emby_library": sample.get("library", ""),
+            "category": "电视剧" if is_ep else "电影",
         }
 
     def _run_template_test(self, kind: str) -> Dict[str, Any]:
@@ -2687,9 +4529,14 @@ class embyxiaoluo(_PluginBase):
             pass
 
         variables_hint = (
-            "可用变量：{{item_name}} 标题 | {{episode_text}} 季集 | {{library}} 分类 | {{genres}} 类型 | "
+            "可用变量：{{item_name}} 标题 | {{episode_text}} 季集 | "
+            "{{episode_title}} 单集标题 | {{episode_overview}} 单集简介 | {{series_overview}} 整剧简介 | "
+            "{{category}} 分类（电影/电视剧） | {{genres}} 类型（剧情/喜剧等） | "
+            "{{library}} 类别（国产剧/日韩剧/欧美剧，按 TMDB 出品地区；取不到用 Emby 库名） | "
+            "{{emby_library}} Emby 媒体库名 | "
             "{{rating}} 评分 | {{release_date}} 发行 | {{cast}} 主演 | {{overview}} 简介 | "
-            "{{original_title}} 原名 | {{duration}} 时长 | {{year}} 年份 | {{type_text}} 类型文字 | "
+            "{{original_title}} 原名 | {{duration}} 时长 | {{year}} 年份 | "
+            "{{type_text}} 旧变量（剧集/电影，等同分类） | "
             "{{server_name}} 服务器 | {{file_path}} 文件 | {{added_at}} 时间 | "
             "{{detail_link}} 查看详情(Markdown) | {{detail_link_html}} 查看详情(HTML) | "
             "{{play_url}} 播放链接 | {{tmdb_url}} TMDB"
@@ -2883,6 +4730,32 @@ class embyxiaoluo(_PluginBase):
             "feishu_webhook": "",
             "feishu_title_template": self._default_feishu_title_template(),
             "feishu_body_template": self._default_feishu_body_template(),
+            "del_tg_title_template": "",
+            "del_tg_body_template": "",
+            "del_feishu_title_template": "",
+            "del_feishu_body_template": "",
+            "event_tg_title_template": "",
+            "event_tg_body_template": "",
+            "event_feishu_title_template": "",
+            "event_feishu_body_template": "",
+            # 电影/剧集是否分开设计模板（默认共用一套）
+            "split_by_type": False,
+            "tg_movie_title_template": "",
+            "tg_movie_body_template": "",
+            "feishu_movie_title_template": "",
+            "feishu_movie_body_template": "",
+            # 每日观影报告
+            "report_enabled": False,
+            "report_time": "22:00",
+            "report_period": "daily",
+            "report_sort": "count",
+            "report_limit": 5,
+            "report_background": "purple",
+            "report_background_url": "",
+            "report_tg_title_template": "",
+            "report_tg_body_template": "",
+            "report_feishu_title_template": "",
+            "report_feishu_body_template": "",
             # 固定行为（界面不再暴露）
             "enable_tmdb": True, "enable_watch_link": True, "watch_link_type": "server",
             "link_redirect_prefix": "", "emby_server_url": "", "emby_server_name": "",
@@ -2893,7 +4766,7 @@ class embyxiaoluo(_PluginBase):
     @staticmethod
     def get_render_mode() -> Tuple[str, str]:
         """使用 Vue 模块联邦渲染插件详情页与配置页。"""
-        return "vue", "dist/v1_0_19/assets"
+        return "vue", "dist/v1_0_44/assets"
 
     def get_page(self) -> List[dict]:
         """详情页由 Vue 组件通过插件 API 加载数据。"""
