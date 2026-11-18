@@ -141,7 +141,7 @@ const LOCAL_SAMPLES = {
     cast: '曾蓉, 白雪岑, 王婧儿', overview: '齐昊暗送田灵儿清凉珠，大竹峰众人前往通天峰。',
     server_name: '测试服务器', status_text: '测试通知', tmdb_id: '206484',
     season: '1', episode: '5', season_id: '1', episode_id: '5',
-    episode_title: '第 5 集', episode_overview: '齐昊暗送田灵儿清凉珠，大竹峰众人前往通天峰。',
+    episode_title: '初入青云', episode_overview: '齐昊暗送田灵儿清凉珠，大竹峰众人前往通天峰。',
     series_overview: '平凡的少年张小凡，在青云门大竹峰成长的故事。',
     original_title: '诛仙', duration: '24', year: '2022', type_text: '剧集',
     file_path: '/影视城/电视剧/诛仙 (2022)/Season 01/诛仙.S01E05.mkv',
@@ -646,7 +646,7 @@ const previewTitle = computed(() => {
 function dropEmptyLabels(text) {
   // 与后端 _drop_empty_label_lines 一致：变量为空时整行不显示
   return String(text || '').split('\n')
-    .filter((line) => !/^\s*[^：:\n]{1,20}[：:]\s*$/.test(line))
+    .filter((line) => !/^\s*[^：:∶\n]{1,20}[：:∶]\s*$/.test(line))
     .join('\n')
 }
 
@@ -1695,7 +1695,7 @@ return (_ctx, _cache) => {
                                   _createElementVNode("b", null, "整剧简介", -1),
                                   _createTextVNode("=整部剧简介；电影用", -1),
                                   _createElementVNode("b", null, "简介", -1),
-                                  _createTextVNode("。多集合并入库时不显示单集标题/简介。", -1)
+                                  _createTextVNode("。单集标题只有集号（如「第 168 集」）时视为没有、整行自动隐藏；多集合并入库时不显示单集标题/简介。", -1)
                                 ]))]))
                               : (_openBlock(), _createElementBlock("div", _hoisted_13, "报告数据来自 Emby 活动日志：电影按片、剧集按「剧」聚合（多集只占一个名次）。报告周期只决定榜单统计范围（当天 / 最近 7 天 / 最近 30 天），通知仍是每天按「通知时间」发送；范围内没有播放记录时不会发送。")),
                             (_openBlock(true), _createElementBlock(_Fragment, null, _renderList(activeVariableGroups.value, (g) => {
@@ -2225,7 +2225,7 @@ return (_ctx, _cache) => {
                                   _createElementVNode("b", null, "整剧简介", -1),
                                   _createTextVNode("=整部剧简介；电影用", -1),
                                   _createElementVNode("b", null, "简介", -1),
-                                  _createTextVNode("。多集合并入库时不显示单集标题/简介。", -1)
+                                  _createTextVNode("。单集标题只有集号（如「第 168 集」）时视为没有、整行自动隐藏；多集合并入库时不显示单集标题/简介。", -1)
                                 ]))]))
                               : (_openBlock(), _createElementBlock("div", _hoisted_37, "报告数据来自 Emby 活动日志：电影按片、剧集按「剧」聚合（多集只占一个名次）。报告周期只决定榜单统计范围（当天 / 最近 7 天 / 最近 30 天），通知仍是每天按「通知时间」发送；范围内没有播放记录时不会发送。")),
                             (_openBlock(true), _createElementBlock(_Fragment, null, _renderList(activeVariableGroups.value, (g) => {
@@ -2469,6 +2469,6 @@ return (_ctx, _cache) => {
 }
 
 };
-const Settings = /*#__PURE__*/_export_sfc(_sfc_main, [['__scopeId',"data-v-b5211906"]]);
+const Settings = /*#__PURE__*/_export_sfc(_sfc_main, [['__scopeId',"data-v-fc57e372"]]);
 
 export { Settings as S };

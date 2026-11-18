@@ -163,7 +163,7 @@ class embyxiaoluo(_PluginBase):
     plugin_name = "Emby 聚合通知"
     plugin_desc = "把 Emby 的入库、删除、事件与每日观影报告聚合推送到 Telegram / 飞书；模板可自定义，支持实时预览与测试发送。"
     plugin_icon = "https://raw.githubusercontent.com/xiaoluo-mp/MoviePilot-Local-Plugins/main/plugins.v2/embyxiaoluo/logo.png?v=1.0.17"
-    plugin_version = "1.0.44"
+    plugin_version = "1.0.45"
     plugin_author = "小罗"
     author_url = "https://github.com/xiaoluo-mp/MoviePilot-Local-Plugins"
     plugin_config_prefix = "embyxiaoluo_"
@@ -3359,7 +3359,13 @@ class embyxiaoluo(_PluginBase):
 
     # TMDB 没有单集译名时的占位标题（如「第 22 集」「Episode 22」「S01E22」）
     GENERIC_EPISODE_TITLE_RE = re.compile(
-        r"^\s*(?:第\s*\d+\s*集|Episode\s*\d+|S\d+\s*E\d+)\s*$", re.IGNORECASE
+        r"^\s*(?:"
+        r"第\s*\d+\s*[集话話]"
+        r"|(?:Episode|Ep\.?|EP\.?)\s*\d+"
+        r"|S\d+\s*[\-_. ]?\s*E\d+"
+        r"|\d+\s*[集话話]"
+        r")\s*$",
+        re.IGNORECASE,
     )
 
     @classmethod
@@ -3399,12 +3405,14 @@ class embyxiaoluo(_PluginBase):
 
         tmdb_title = str(tmdb_meta.get("episode_title") or "").strip()
         emby_title = str(extra.get("episode_name") or "").strip()
-        if self._is_generic_episode_title(tmdb_title) and emby_title \
-                and not self._is_generic_episode_title(emby_title):
-            # TMDB 只有「第 N 集」，而 Emby 有真实集名时优先 Emby
+        # 只取「真实集名」：像「第 168 集」「Episode 168」「S01E168」这种只是集号的占位标题，
+        # 一律当作没有标题，模板里那一行会自动隐藏，避免出现「单集标题：第 168 集」这种废话
+        if tmdb_title and not self._is_generic_episode_title(tmdb_title):
+            title = tmdb_title
+        elif emby_title and not self._is_generic_episode_title(emby_title):
             title = emby_title
         else:
-            title = tmdb_title or emby_title
+            title = ""
         overview = (
             str(tmdb_meta.get("episode_overview") or "").strip()
             or str(extra.get("episode_overview") or "").strip()
@@ -3852,7 +3860,7 @@ class embyxiaoluo(_PluginBase):
             return text
         rows = [
             line for line in str(text).split("\n")
-            if not re.fullmatch(r"\s*[^：:\n]{1,20}[：:]\s*", line)
+            if not re.fullmatch(r"\s*[^：:∶\n]{1,20}[：:∶]\s*", line)
         ]
         return "\n".join(rows)
 
@@ -4345,7 +4353,7 @@ class embyxiaoluo(_PluginBase):
     }
 
     SAMPLE_CACHE_TTL = 6 * 3600
-    SAMPLE_CACHE_KEY = "sample_v4_"
+    SAMPLE_CACHE_KEY = "sample_v5_"
 
     def _build_test_media(self, kind: str) -> dict:
         """返回样例媒体：命中插件数据缓存时立即返回，避免每次都等 TMDB。"""
@@ -4766,7 +4774,7 @@ class embyxiaoluo(_PluginBase):
     @staticmethod
     def get_render_mode() -> Tuple[str, str]:
         """使用 Vue 模块联邦渲染插件详情页与配置页。"""
-        return "vue", "dist/v1_0_44/assets"
+        return "vue", "dist/v1_0_45/assets"
 
     def get_page(self) -> List[dict]:
         """详情页由 Vue 组件通过插件 API 加载数据。"""

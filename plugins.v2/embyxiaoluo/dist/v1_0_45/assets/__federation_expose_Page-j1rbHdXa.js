@@ -1,5 +1,5 @@
 import { importShared } from './__federation_fn_import-JrT3xvdd.js';
-import { S as Settings } from './Settings-fbA2A3Ou.js';
+import { S as Settings } from './Settings-DD4PpDOe.js';
 
 const {openBlock:_openBlock,createBlock:_createBlock} = await importShared('vue');
 
