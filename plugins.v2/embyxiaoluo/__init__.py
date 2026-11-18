@@ -163,7 +163,7 @@ class embyxiaoluo(_PluginBase):
     plugin_name = "Emby 聚合通知"
     plugin_desc = "把 Emby 的入库、删除、事件与每日观影报告聚合推送到 Telegram / 飞书；模板可自定义，支持实时预览与测试发送。"
     plugin_icon = "https://raw.githubusercontent.com/xiaoluo-mp/MoviePilot-Local-Plugins/main/plugins.v2/embyxiaoluo/logo.png?v=1.0.17"
-    plugin_version = "1.0.46"
+    plugin_version = "1.0.47"
     plugin_author = "小罗"
     author_url = "https://github.com/xiaoluo-mp/MoviePilot-Local-Plugins"
     plugin_config_prefix = "embyxiaoluo_"
@@ -2868,7 +2868,7 @@ class embyxiaoluo(_PluginBase):
             "episode_text": episode_text,
             "season_id": info.season_id,
             "episode_id": info.episode_id,
-            "overview": overview,
+            "overview": self._clean_overview(overview),
             "image_url": image_url,
             "server_name": server_name or (str(info.channel or "").upper() or "MediaServer"),
             "user_name": info.user_name or "",
@@ -3024,7 +3024,7 @@ class embyxiaoluo(_PluginBase):
             "is_ep": is_ep,
             "status_text": "媒体已删除",
             "episode_text": episode_text,
-            "overview": info.overview or str(item.get("Overview") or ""),
+            "overview": self._clean_overview(info.overview or str(item.get("Overview") or "")),
             "image_url": "",
             "server_name": server_name or str(info.channel or "").upper(),
             "channel": info.channel or "",
@@ -3194,7 +3194,8 @@ class embyxiaoluo(_PluginBase):
             "is_ep": is_ep, "status_text": status_text, "episode_text": episode_text,
             "episode_title": episode_title, "episode_overview": episode_overview,
             "series_overview": series_overview,
-            "overview": overview, "image_url": image_url, "server_name": display_name,
+            "overview": self._clean_overview(overview),
+            "image_url": image_url, "server_name": display_name,
             "channel": info.channel or "", "play_url": play_url, "detail_url": detail_url, "tmdb_url": tmdb_url,
             "tmdb_id": info.tmdb_id or "", "season_id": info.season_id, "episode_id": info.episode_id,
             "genres": tmdb_meta.get("genres", "") or emby_genres, "cast": tmdb_meta.get("cast", ""),
@@ -3399,9 +3400,9 @@ class embyxiaoluo(_PluginBase):
         is_ep = info.item_type in ("TV", "SHOW", "Episode")
         if not is_ep:
             return "", "", ""
-        series_overview = str(tmdb_meta.get("series_overview") or "").strip()
+        series_overview = self._clean_overview(tmdb_meta.get("series_overview"))
         if not series_overview:
-            series_overview = str((emby_item or {}).get("Overview") or "").strip()
+            series_overview = self._clean_overview((emby_item or {}).get("Overview"))
 
         tmdb_title = str(tmdb_meta.get("episode_title") or "").strip()
         emby_title = str(extra.get("episode_name") or "").strip()
@@ -3413,9 +3414,8 @@ class embyxiaoluo(_PluginBase):
             title = emby_title
         else:
             title = ""
-        overview = (
-            str(tmdb_meta.get("episode_overview") or "").strip()
-            or str(extra.get("episode_overview") or "").strip()
+        overview = self._clean_overview(
+            tmdb_meta.get("episode_overview") or extra.get("episode_overview")
         )
         return title, overview, series_overview
 
@@ -3800,6 +3800,29 @@ class embyxiaoluo(_PluginBase):
         while out and not out[-1]:
             out.pop()
         return "\n".join(out).strip("\n")
+
+    @staticmethod
+    def _clean_overview(text: str) -> str:
+        """
+        清洗简介里的 HTML 片段。
+
+        TMDB / Emby 的简介偶尔带 ``<br>``、``<p>``、``&nbsp;`` 这类标记。Telegram 只支持
+        有限的几个标签，遇到 ``<br>`` 会把它转义成文字显示；飞书 markdown 却会渲染成换行，
+        于是同一段简介两边表现不一致。这里统一把换行类标签转成真正的换行、去掉其余标签。
+
+        :param text: 原始简介
+        :return str: 纯文本（保留换行）
+        """
+
+        raw = html.unescape(str(text or ""))
+        raw = re.sub(r"<\s*br\s*/?\s*>", "\n", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"<\s*/\s*(?:p|div|li|tr|h[1-6])\s*>", "\n", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"<\s*(?:p|div|li|tr|h[1-6])\b[^>]*>", "", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"<[^>]+>", "", raw)
+        raw = raw.replace("\u00a0", " ")
+        raw = re.sub(r"[ \t]+\n", "\n", raw)
+        raw = re.sub(r"\n{3,}", "\n\n", raw)
+        return raw.strip()
 
     @staticmethod
     def _keep_spaces(text: str) -> str:
@@ -4439,7 +4462,9 @@ class embyxiaoluo(_PluginBase):
             "episode_overview": meta.get("episode_overview", ""),
             "series_overview": meta.get("series_overview", ""),
             # 与真实通知一致：剧集的「简介」就是单集简介（无则空），不拿整剧简介顶替
-            "overview": meta.get("episode_overview", "") if is_ep else meta.get("overview_tmdb", ""),
+            "overview": self._clean_overview(
+                meta.get("episode_overview", "") if is_ep else meta.get("overview_tmdb", "")
+            ),
             "image_url": image_url,
             "server_name": "测试服务器",
             "channel": "emby",
