@@ -163,7 +163,7 @@ class embyxiaoluo(_PluginBase):
     plugin_name = "Emby 聚合通知"
     plugin_desc = "把 Emby 的入库、删除、事件与每日观影报告聚合推送到 Telegram / 飞书；模板可自定义，支持实时预览与测试发送。"
     plugin_icon = "https://raw.githubusercontent.com/xiaoluo-mp/MoviePilot-Local-Plugins/main/plugins.v2/embyxiaoluo/logo.png?v=1.0.17"
-    plugin_version = "1.0.45"
+    plugin_version = "1.0.46"
     plugin_author = "小罗"
     author_url = "https://github.com/xiaoluo-mp/MoviePilot-Local-Plugins"
     plugin_config_prefix = "embyxiaoluo_"
@@ -3785,7 +3785,7 @@ class embyxiaoluo(_PluginBase):
             if not plain:
                 continue
             # 形如「主演：」「播放：」的空字段整行丢弃
-            if plain.endswith(("：", ":")) and len(plain) <= 20:
+            if plain.endswith(("：", ":", "∶")) and len(plain) <= 20:
                 continue
             # 只剩 emoji / 符号（如「▶️」）的行也丢弃
             if not re.sub(r"[^\w\u4e00-\u9fff]+", "", plain):
@@ -3987,9 +3987,7 @@ class embyxiaoluo(_PluginBase):
 
     def _send_feishu_app(self, title: str, body: str, media: dict, use_image: bool = True):
         """走飞书自建应用 OpenAPI 发送（复用 MP 飞书渠道或插件内自填凭据）。"""
-        if media.get("episode_merged"):
-            body = self._drop_empty_label_lines(body)
-        body = self._keep_spaces(body)
+        body = self._keep_spaces(self._drop_empty_label_lines(body))
         app_id = self._effective_feishu_app_id
         app_secret = self._effective_feishu_app_secret
         candidates = self._feishu_candidates()
@@ -4040,9 +4038,7 @@ class embyxiaoluo(_PluginBase):
 
     def _send_feishu_webhook(self, title: str, body: str, media: dict):
         """走飞书群自定义机器人 Webhook 发送。"""
-        if media.get("episode_merged"):
-            body = self._drop_empty_label_lines(body)
-        body = self._keep_spaces(body)
+        body = self._keep_spaces(self._drop_empty_label_lines(body))
         webhook = self._feishu_webhook
         if not webhook:
             logger.warning("Emby入库通知 未填写飞书群机器人 Webhook，已跳过")
