@@ -163,7 +163,7 @@ class embyxiaoluo(_PluginBase):
     plugin_name = "Emby 聚合通知"
     plugin_desc = "把 Emby 的入库、删除、事件与每日观影报告聚合推送到 Telegram / 飞书；模板可自定义，支持实时预览与测试发送。"
     plugin_icon = "https://raw.githubusercontent.com/xiaoluo-mp/MoviePilot-Local-Plugins/main/plugins.v2/embyxiaoluo/logo.png?v=1.0.17"
-    plugin_version = "1.0.47"
+    plugin_version = "1.0.48"
     plugin_author = "小罗"
     author_url = "https://github.com/xiaoluo-mp/MoviePilot-Local-Plugins"
     plugin_config_prefix = "embyxiaoluo_"
@@ -2070,13 +2070,15 @@ class embyxiaoluo(_PluginBase):
         """下载图片并返回 (宽, 高)；失败返回 None（不阻塞发送）。"""
         if not url or not url.startswith(("http://", "https://")):
             return None
-        try:
-            res = requests.get(url, timeout=15, proxies=self._proxies)
-            if res.status_code != 200 or not res.content:
-                return None
-            return self._size_from_bytes(res.content)
-        except Exception:  # pylint: disable=broad-except
-            return None
+        # 与图片获取一致：内网 Emby 图直连、外网 TMDB 图可能需代理，逐个尝试
+        for kwargs in ({}, {"proxies": self._proxies}):
+            try:
+                res = requests.get(url, timeout=15, **kwargs)
+                if res.status_code == 200 and res.content:
+                    return self._size_from_bytes(res.content)
+            except Exception:  # pylint: disable=broad-except
+                continue
+        return None
 
     def _tmdb_image_url(self, path: str, size: str = "w500") -> str:
         if not path:
@@ -3950,12 +3952,21 @@ class embyxiaoluo(_PluginBase):
             )
             if not url.startswith(("http://", "https://")):
                 return ""
-            try:
-                res = requests.get(url, timeout=20, proxies=self._proxies)
-                content = res.content if res.status_code == 200 else None
-            except Exception as e:  # pylint: disable=broad-except
-                logger.warning(f"Emby入库通知 飞书海报下载失败：{e}")
-                content = None
+            # 直连优先、代理兜底：Emby 封面是内网地址，经代理会被拒（400），
+            # 而 TMDB 图在部分网络下必须走代理，两种来源都要覆盖。
+            for kwargs in ({}, {"proxies": self._proxies}):
+                try:
+                    res = requests.get(url, timeout=20, **kwargs)
+                    if res.status_code == 200 and res.content:
+                        content = res.content
+                        break
+                except Exception as e:  # pylint: disable=broad-except
+                    logger.warning(f"Emby入库通知 飞书海报下载失败：{e}")
+            if not content:
+                logger.warning(
+                    f"Emby入库通知 飞书海报下载未成功（直连+代理均失败），卡片将不含图片："
+                    f"{url.split('?')[0]}"
+                )
         if not content:
             return ""
         path: Optional[Path] = None
