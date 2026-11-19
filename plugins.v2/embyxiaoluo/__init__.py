@@ -163,7 +163,7 @@ class embyxiaoluo(_PluginBase):
     plugin_name = "Emby 聚合通知"
     plugin_desc = "把 Emby 的入库、删除、事件与每日观影报告聚合推送到 Telegram / 飞书；模板可自定义，支持实时预览与测试发送。"
     plugin_icon = "https://raw.githubusercontent.com/xiaoluo-mp/MoviePilot-Local-Plugins/main/plugins.v2/embyxiaoluo/logo.png?v=1.0.17"
-    plugin_version = "1.0.48"
+    plugin_version = "1.0.49"
     plugin_author = "小罗"
     author_url = "https://github.com/xiaoluo-mp/MoviePilot-Local-Plugins"
     plugin_config_prefix = "embyxiaoluo_"
@@ -3976,7 +3976,14 @@ class embyxiaoluo(_PluginBase):
                 path = Path(fh.name)
             resp = api.upload_image(path)
             if resp.success():
-                return str((resp.data or {}).get("image_key") or "")
+                image_key = str((resp.data or {}).get("image_key") or "")
+                if image_key:
+                    logger.info(
+                        f"Emby入库通知 飞书封面已上传：{image_key[:12]}…（{len(content) // 1024}KB）"
+                    )
+                else:
+                    logger.warning("Emby入库通知 飞书封面上传成功但没有返回 image_key")
+                return image_key
             logger.warning(
                 f"Emby入库通知 飞书海报上传失败：code={resp.code} msg={resp.msg[:100]}"
             )
@@ -4022,6 +4029,10 @@ class embyxiaoluo(_PluginBase):
     def _send_feishu_app(self, title: str, body: str, media: dict, use_image: bool = True):
         """走飞书自建应用 OpenAPI 发送（复用 MP 飞书渠道或插件内自填凭据）。"""
         body = self._keep_spaces(self._drop_empty_label_lines(body))
+        logger.info(
+            f"Emby入库通知 飞书发送准备：use_image={use_image} "
+            f"封面={'有' if media.get('image_url') else '无'}"
+        )
         app_id = self._effective_feishu_app_id
         app_secret = self._effective_feishu_app_secret
         candidates = self._feishu_candidates()
